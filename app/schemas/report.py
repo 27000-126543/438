@@ -158,3 +158,27 @@ class MultiDimensionReport(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RegionMetrics(BaseModel):
+    region: str
+    total_vehicles: int
+    active_vehicles: int
+    total_test_distance: float
+    total_alarms: int
+    critical_alarms: int
+    accident_rate: float
+    total_devices: int
+    online_devices: int
+    device_online_rate: float
+    new_accidents: int
+
+
+class RegionComparisonResponse(BaseModel):
+    report_date: date
+    regions: List[str]
+    metrics: List[RegionMetrics]
+    comparison_summary: Dict[str, Any]
+
+    class Config:
+        from_attributes = True

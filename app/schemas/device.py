@@ -182,14 +182,48 @@ class MaintenanceWorkOrderResponse(MaintenanceWorkOrderBase):
         from_attributes = True
 
 
+class AssignmentBasis(BaseModel):
+    skill_score: float
+    skill_weight: float
+    distance_score: float
+    distance_weight: float
+    workload_score: float
+    workload_weight: float
+    total_score: float
+    skill_match_ratio: float
+    distance_km: float
+    current_workload: int
+
+    class Config:
+        from_attributes = True
+
+
+class EscalationRule(BaseModel):
+    level: int
+    condition: str
+    action: str
+    notify_roles: List[str]
+    timeout_minutes: int
+
+    class Config:
+        from_attributes = True
+
+
 class MaintenanceAssignment(BaseModel):
     work_order_id: int
     order_number: str
-    assigned_staff_id: int
-    assigned_staff_name: str
-    matched_skills: List[str]
+    assigned_staff_id: Optional[int] = None
+    assigned_staff_name: Optional[str] = None
+    matched_skills: Optional[List[str]] = None
     missing_skills: Optional[List[str]] = None
+    estimated_arrival_time: Optional[datetime] = None
     estimated_completion_time: Optional[datetime] = None
+    assignment_basis: Optional[AssignmentBasis] = None
+    escalation_rules: Optional[List[EscalationRule]] = None
+    success: bool = False
+    reason: Optional[str] = None
+    message: Optional[str] = None
+    pending_reason_detail: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True

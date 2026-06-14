@@ -31,6 +31,8 @@ from app.schemas.report import (
     SafetyStatistics,
     DeviceStatistics,
     MultiDimensionReport,
+    RegionMetrics,
+    RegionComparisonResponse,
 )
 
 router = APIRouter(tags=["运营报表"])
@@ -208,9 +210,11 @@ async def generate_daily_report(
         else:
             accident_rate = 0.0
 
-        devices_query = select(RoadsideDevice)
+        devices_query = select(RoadsideDevice).join(
+            TestRoute, RoadsideDevice.route_id == TestRoute.id
+        ).where(TestRoute.company_id == company.id)
         if region:
-            devices_query = devices_query.join(TestRoute).where(TestRoute.test_area == region)
+            devices_query = devices_query.where(TestRoute.test_area == region)
         all_devices_result = await db.execute(devices_query)
         all_devices = all_devices_result.scalars().all()
         total_devices = len(all_devices)
@@ -439,6 +443,7 @@ async def export_reports(
     start_date: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD，默认30天前"),
     end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD，默认今天"),
     region: Optional[str] = None,
+    regions: Optional[List[str]] = Query(None, description="区域列表，可传多个，与region二选一"),
     format: Optional[str] = Query("csv", description="导出格式: csv, json"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -479,6 +484,8 @@ async def export_reports(
         query = query.where(DailyReport.company_id == company_id)
     if region:
         query = query.where(DailyReport.region == region)
+    if regions:
+        query = query.where(DailyReport.region.in_(regions))
 
     query = query.order_by(DailyReport.report_date)
     result = await db.execute(query)
@@ -555,9 +562,13 @@ async def get_overview_statistics(
         today_records = today_data.scalars().all()
         active_count = len(set(r.vehicle_id for r in today_records))
 
-    devices_query = select(RoadsideDevice)
+    devices_query = select(RoadsideDevice).join(
+        TestRoute, RoadsideDevice.route_id == TestRoute.id
+    )
+    if company_id:
+        devices_query = devices_query.where(TestRoute.company_id == company_id)
     if region:
-        devices_query = devices_query.join(TestRoute).where(TestRoute.test_area == region)
+        devices_query = devices_query.where(TestRoute.test_area == region)
     devices_result = await db.execute(devices_query)
     all_devices = devices_result.scalars().all()
     total_devices = len(all_devices)
@@ -602,6 +613,163 @@ async def get_overview_statistics(
             "total_test_distance": round(total_distance, 2),
         },
     }
+
+
+@router.get("/compare-regions", response_model=RegionComparisonResponse, summary="多区域数据对比")
+async def compare_regions(
+    company_id: Optional[int] = None,
+    report_date: Optional[str] = Query(None, description="对比日期 YYYY-MM-DD，默认今天"),
+    regions: Optional[List[str]] = Query(None, description="区域列表，可传多个"),
+    db: AsyncSession = Depends(get_db),
+):
+    if report_date:
+        try:
+            target_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
+    else:
+        target_date = date.today()
+
+    if not regions:
+        raise HTTPException(status_code=400, detail="请至少指定一个区域")
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+
+    regions_list = list(regions)
+    all_metrics = []
+
+    for region in regions_list:
+        vehicles_query = select(TestVehicle)
+        if company_id:
+            vehicles_query = vehicles_query.where(TestVehicle.company_id == company_id)
+        vehicles_query = vehicles_query.where(TestVehicle.test_area == region)
+        vehicles_result = await db.execute(vehicles_query)
+        all_vehicles = vehicles_result.scalars().all()
+        total_vehicles = len(all_vehicles)
+        vehicle_ids = [v.id for v in all_vehicles]
+
+        active_count = 0
+        total_test_distance = 0.0
+        if vehicle_ids:
+            data_result = await db.execute(
+                select(VehicleRealtimeData).where(
+                    and_(
+                        VehicleRealtimeData.vehicle_id.in_(vehicle_ids),
+                        VehicleRealtimeData.timestamp >= day_start,
+                        VehicleRealtimeData.timestamp < day_end,
+                    )
+                )
+            )
+            realtime_data = data_result.scalars().all()
+            active_count = len(set(d.vehicle_id for d in realtime_data))
+
+            prev_points = {}
+            for data in realtime_data:
+                prev = prev_points.get(data.vehicle_id)
+                if prev and prev.latitude and prev.longitude and data.latitude and data.longitude:
+                    from math import radians, sin, cos, sqrt, atan2
+                    EARTH_RADIUS_KM = 6371.0
+                    lat1, lon1 = radians(prev.latitude), radians(prev.longitude)
+                    lat2, lon2 = radians(data.latitude), radians(data.longitude)
+                    dlat = lat2 - lat1
+                    dlon = lon2 - lon1
+                    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+                    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+                    total_test_distance += EARTH_RADIUS_KM * c
+                prev_points[data.vehicle_id] = data
+
+        alarms_query = select(Alarm).where(
+            and_(
+                Alarm.created_at >= day_start,
+                Alarm.created_at < day_end,
+            )
+        )
+        if company_id:
+            alarms_query = alarms_query.where(Alarm.company_id == company_id)
+        if vehicle_ids:
+            alarms_query = alarms_query.where(Alarm.vehicle_id.in_(vehicle_ids))
+        else:
+            alarms_query = alarms_query.join(TestVehicle).where(
+                and_(TestVehicle.test_area == region,
+                     TestVehicle.company_id == company_id if company_id else True)
+            )
+        alarms_result = await db.execute(alarms_query)
+        alarms = alarms_result.scalars().all()
+        total_alarms = len(alarms)
+        critical_alarms = len([a for a in alarms if a.alarm_level == "critical"])
+
+        accidents_query = select(AccidentReport).where(
+            and_(
+                AccidentReport.accident_time >= day_start,
+                AccidentReport.accident_time < day_end,
+            )
+        )
+        if company_id:
+            accidents_query = accidents_query.where(AccidentReport.company_id == company_id)
+        if vehicle_ids:
+            accidents_query = accidents_query.where(AccidentReport.vehicle_id.in_(vehicle_ids))
+        else:
+            accidents_query = accidents_query.join(TestVehicle).where(
+                and_(TestVehicle.test_area == region,
+                     TestVehicle.company_id == company_id if company_id else True)
+            )
+        accidents_result = await db.execute(accidents_query)
+        new_accidents = len(accidents_result.scalars().all())
+
+        accident_rate = (new_accidents / max(total_test_distance, 1) * 1000.0) if total_test_distance > 0 else 0.0
+
+        devices_query = select(RoadsideDevice).join(
+            TestRoute, RoadsideDevice.route_id == TestRoute.id
+        )
+        if company_id:
+            devices_query = devices_query.where(TestRoute.company_id == company_id)
+        devices_query = devices_query.where(TestRoute.test_area == region)
+        devices_result = await db.execute(devices_query)
+        all_devices = devices_result.scalars().all()
+        total_devices = len(all_devices)
+        online_devices = len([d for d in all_devices if d.status == "online"])
+        device_online_rate = (online_devices / total_devices * 100) if total_devices > 0 else 0.0
+
+        all_metrics.append(RegionMetrics(
+            region=region,
+            total_vehicles=total_vehicles,
+            active_vehicles=active_count,
+            total_test_distance=round(total_test_distance, 2),
+            total_alarms=total_alarms,
+            critical_alarms=critical_alarms,
+            accident_rate=round(accident_rate, 4),
+            total_devices=total_devices,
+            online_devices=online_devices,
+            device_online_rate=round(device_online_rate, 2),
+            new_accidents=new_accidents
+        ))
+
+    best_active = max(all_metrics, key=lambda x: x.active_vehicles) if all_metrics else None
+    best_distance = max(all_metrics, key=lambda x: x.total_test_distance) if all_metrics else None
+    best_device_rate = max(all_metrics, key=lambda x: x.device_online_rate) if all_metrics else None
+    lowest_accident = min(all_metrics, key=lambda x: x.accident_rate) if all_metrics else None
+
+    comparison_summary = {
+        "total_regions_compared": len(all_metrics),
+        "best_active_vehicles": best_active.region if best_active else None,
+        "best_test_distance": best_distance.region if best_distance else None,
+        "best_device_online_rate": best_device_rate.region if best_device_rate else None,
+        "lowest_accident_rate": lowest_accident.region if lowest_accident else None,
+        "rankings": {
+            "active_vehicles": [{"region": m.region, "value": m.active_vehicles} for m in sorted(all_metrics, key=lambda x: x.active_vehicles, reverse=True)],
+            "total_alarms": [{"region": m.region, "value": m.total_alarms} for m in sorted(all_metrics, key=lambda x: x.total_alarms, reverse=True)],
+            "accident_rate": [{"region": m.region, "value": m.accident_rate} for m in sorted(all_metrics, key=lambda x: x.accident_rate)],
+            "device_online_rate": [{"region": m.region, "value": m.device_online_rate} for m in sorted(all_metrics, key=lambda x: x.device_online_rate, reverse=True)],
+        }
+    }
+
+    return RegionComparisonResponse(
+        report_date=target_date,
+        regions=regions_list,
+        metrics=all_metrics,
+        comparison_summary=comparison_summary
+    )
 
 
 @router.get("/{report_id}", summary="获取报表详情", response_model=DailyReportResponse)

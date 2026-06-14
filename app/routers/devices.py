@@ -30,6 +30,11 @@ router = APIRouter(tags=["路侧设备管理"])
 
 OFFLINE_THRESHOLD_MINUTES = 30
 EARTH_RADIUS_KM = 6371.0
+MIN_SKILL_MATCH_RATIO = 0.3
+MAX_DISTANCE_KM = 30
+MAX_WORKLOAD = 8
+AVERAGE_TRAVEL_SPEED_KMH = 30
+ESTIMATED_REPAIR_MINUTES = 60
 
 
 class DeviceUpdate(BaseModel):
@@ -59,6 +64,60 @@ def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     a = sin(dlat / 2) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon / 2) ** 2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return EARTH_RADIUS_KM * c
+
+
+def generate_escalation_rules(priority: str) -> List[dict]:
+    if priority in ["critical", "urgent"]:
+        return [
+            {
+                "level": 1,
+                "condition": "15分钟未接单",
+                "action": "通知区域主管",
+                "notify_roles": ["区域主管", "运维经理"],
+                "timeout_minutes": 15
+            },
+            {
+                "level": 2,
+                "condition": "30分钟未到场",
+                "action": "升级至运维总监",
+                "notify_roles": ["运维总监", "运营经理"],
+                "timeout_minutes": 30
+            },
+            {
+                "level": 3,
+                "condition": "60分钟未修复",
+                "action": "启动备用人员池",
+                "notify_roles": ["运维总监", "客户服务"],
+                "timeout_minutes": 60
+            }
+        ]
+    elif priority == "high":
+        return [
+            {
+                "level": 1,
+                "condition": "30分钟未接单",
+                "action": "通知区域主管",
+                "notify_roles": ["区域主管"],
+                "timeout_minutes": 30
+            },
+            {
+                "level": 2,
+                "condition": "60分钟未到场",
+                "action": "升级至运维经理",
+                "notify_roles": ["运维经理"],
+                "timeout_minutes": 60
+            }
+        ]
+    else:
+        return [
+            {
+                "level": 1,
+                "condition": "60分钟未接单",
+                "action": "通知区域主管",
+                "notify_roles": ["区域主管"],
+                "timeout_minutes": 60
+            }
+        ]
 
 
 @router.post("/heartbeat", summary="设备心跳上报")
@@ -133,33 +192,50 @@ async def auto_assign_work_order(
     db: AsyncSession
 ):
     required_skills = set(order.required_skills or [])
+    priority = order.priority or "normal"
 
     staff_result = await db.execute(
         select(MaintenanceStaff).where(
             MaintenanceStaff.status.in_(["available", "on_duty"])
         )
     )
-    available_staff = staff_result.scalars().all()
+    all_staff = staff_result.scalars().all()
 
-    if not available_staff:
+    if not all_staff:
         return {
             "success": False,
             "reason": "no_available_staff",
-            "message": "没有可用的维护人员，工单保持待分配状态"
+            "message": "当前没有可用的维护人员",
+            "pending_reason_detail": {
+                "no_staff": True,
+                "insufficient_skills": 0,
+                "too_far": 0,
+                "workload_full": 0,
+                "available_count": 0,
+                "skill_match_count": 0,
+                "distance_ok_count": 0,
+                "workload_ok_count": 0,
+                "qualification_note": f"资格筛选：技能匹配率>={int(MIN_SKILL_MATCH_RATIO*100)}%, 距离<={MAX_DISTANCE_KM}km, 负载<={MAX_WORKLOAD}单"
+            }
         }
 
-    scored_staff = []
-    for staff in available_staff:
-        score = 0.0
+    no_skill_count = 0
+    too_far_count = 0
+    overloaded_count = 0
+    eligible_staff = []
+
+    for staff in all_staff:
         staff_skills = set(staff.skills or [])
+        is_eligible = True
 
         if required_skills:
             matched = len(required_skills & staff_skills)
-            skill_score = matched / len(required_skills) if required_skills else 1.0
-            score += skill_score * 60
-        else:
-            score += 60
+            skill_ratio = matched / len(required_skills) if required_skills else 1.0
+            if skill_ratio < MIN_SKILL_MATCH_RATIO:
+                no_skill_count += 1
+                is_eligible = False
 
+        distance = None
         if device and staff.current_latitude and staff.current_longitude and device.latitude and device.longitude:
             distance = calculate_distance(
                 device.latitude,
@@ -167,30 +243,106 @@ async def auto_assign_work_order(
                 staff.current_latitude,
                 staff.current_longitude,
             )
-            distance_score = max(0.0, 1.0 - distance / 50.0)
-            score += distance_score * 30
-        else:
-            score += 15
+            if distance > MAX_DISTANCE_KM:
+                too_far_count += 1
+                is_eligible = False
 
-        workload_score = max(0.0, 1.0 - staff.workload / 10.0)
-        score += workload_score * 10
+        if staff.workload >= MAX_WORKLOAD:
+            overloaded_count += 1
+            is_eligible = False
 
-        scored_staff.append((score, staff))
+        if is_eligible:
+            eligible_staff.append((staff, distance))
 
-    if not scored_staff:
-        return {
-            "success": False,
-            "reason": "no_matching_skills",
-            "message": "没有匹配技能要求的维护人员，工单保持待分配状态"
+    if not eligible_staff:
+        pending_detail = {
+            "no_staff": len(all_staff) == 0,
+            "insufficient_skills": no_skill_count,
+            "too_far": too_far_count,
+            "workload_full": overloaded_count,
+            "available_count": len(all_staff),
+            "skill_match_count": len(all_staff) - no_skill_count,
+            "distance_ok_count": len(all_staff) - too_far_count,
+            "workload_ok_count": len(all_staff) - overloaded_count,
+            "qualification_note": f"资格筛选：技能匹配率>={int(MIN_SKILL_MATCH_RATIO*100)}%, 距离<={MAX_DISTANCE_KM}km, 负载<={MAX_WORKLOAD}单"
         }
 
-    scored_staff.sort(key=lambda x: x[0], reverse=True)
-    staff = scored_staff[0][1]
+        reasons = []
+        if no_skill_count > 0:
+            reasons.append(f"{no_skill_count} 人技能不匹配（最低要求匹配 {int(MIN_SKILL_MATCH_RATIO*100)}% 技能）")
+        if too_far_count > 0:
+            reasons.append(f"{too_far_count} 人距离超过 {MAX_DISTANCE_KM} 公里")
+        if overloaded_count > 0:
+            reasons.append(f"{overloaded_count} 人工单已达 {MAX_WORKLOAD} 单上限")
+
+        reason_code = "mixed"
+        if pending_detail["insufficient_skills"] > 0 and pending_detail["too_far"] == 0 and pending_detail["workload_full"] == 0:
+            reason_code = "insufficient_skills"
+        elif pending_detail["too_far"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["workload_full"] == 0:
+            reason_code = "too_far"
+        elif pending_detail["workload_full"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["too_far"] == 0:
+            reason_code = "overloaded"
+
+        return {
+            "success": False,
+            "reason": reason_code,
+            "message": "没有符合条件的维护人员：" + "；".join(reasons),
+            "pending_reason_detail": pending_detail
+        }
+
+    scored_staff = []
+    for staff, distance in eligible_staff:
+        score = 0.0
+        staff_skills = set(staff.skills or [])
+
+        skill_score = 0.0
+        distance_score = 0.0
+        workload_score = 0.0
+        skill_match_ratio = 1.0
+
+        if required_skills:
+            matched = len(required_skills & staff_skills)
+            skill_match_ratio = matched / len(required_skills) if required_skills else 1.0
+            skill_score = skill_match_ratio * 60
+        else:
+            skill_score = 60
+        score += skill_score
+
+        if distance is not None:
+            distance_score = max(0.0, 1.0 - distance / MAX_DISTANCE_KM) * 30
+        else:
+            distance_score = 15
+        score += distance_score
+
+        workload_score = max(0.0, 1.0 - staff.workload / MAX_WORKLOAD) * 10
+        score += workload_score
+
+        scored_staff.append({
+            "staff": staff,
+            "score": score,
+            "skill_score": skill_score,
+            "distance_score": distance_score,
+            "workload_score": workload_score,
+            "skill_match_ratio": skill_match_ratio,
+            "distance_km": distance,
+            "current_workload": staff.workload
+        })
+
+    scored_staff.sort(key=lambda x: x["score"], reverse=True)
+    best = scored_staff[0]
+    staff = best["staff"]
+    distance = best["distance_km"]
+
+    travel_time_hours = (distance or 5.0) / AVERAGE_TRAVEL_SPEED_KMH
+    estimated_arrival = datetime.utcnow() + timedelta(hours=travel_time_hours)
+    estimated_completion = estimated_arrival + timedelta(minutes=ESTIMATED_REPAIR_MINUTES)
 
     order.assigned_to = staff.name
     order.assignee_skills = staff.skills
     order.assigned_at = datetime.utcnow()
     order.status = "assigned"
+    order.estimated_arrival = estimated_arrival
+    order.estimated_completion = estimated_completion
     staff.workload += 1
     staff.updated_at = datetime.utcnow()
     order.updated_at = datetime.utcnow()
@@ -202,14 +354,32 @@ async def auto_assign_work_order(
     matched_skills = list(required_skills & set(staff.skills or []))
     missing_skills = list(required_skills - set(staff.skills or [])) if required_skills else None
 
+    assignment_basis = {
+        "skill_score": round(best["skill_score"], 2),
+        "skill_weight": 60,
+        "distance_score": round(best["distance_score"], 2),
+        "distance_weight": 30,
+        "workload_score": round(best["workload_score"], 2),
+        "workload_weight": 10,
+        "total_score": round(best["score"], 2),
+        "skill_match_ratio": round(best["skill_match_ratio"], 2),
+        "distance_km": round(best["distance_km"] or 0, 2),
+        "current_workload": best["current_workload"]
+    }
+
     return {
         "success": True,
         "staff_id": staff.id,
         "staff_name": staff.name,
         "matched_skills": matched_skills,
         "missing_skills": missing_skills,
-        "score": scored_staff[0][0],
-        "message": f"已自动分配给 {staff.name}"
+        "score": round(best["score"], 2),
+        "message": f"已自动分配给 {staff.name}，预计 {travel_time_hours*60:.0f} 分钟后到场",
+        "estimated_arrival_time": estimated_arrival.isoformat(),
+        "estimated_completion_time": estimated_completion.isoformat(),
+        "assignment_basis": assignment_basis,
+        "escalation_rules": generate_escalation_rules(priority),
+        "pending_reason_detail": None
     }
 
 

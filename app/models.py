@@ -379,6 +379,7 @@ class AccidentReport(Base):
     company = relationship("User", back_populates="accident_reports")
     vehicle = relationship("TestVehicle", back_populates="accident_reports")
     alarms = relationship("Alarm", back_populates="accident_report")
+    disposal_steps = relationship("AccidentDisposalStep", back_populates="accident", cascade="all, delete-orphan")
 
     def to_dict(self):
         return {
@@ -603,6 +604,8 @@ class MaintenanceWorkOrder(Base):
     assigned_to = Column(String(80))
     assignee_skills = Column(JSON)
     assigned_at = Column(DateTime)
+    estimated_arrival = Column(DateTime)
+    estimated_completion = Column(DateTime)
     scheduled_at = Column(DateTime)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
@@ -639,6 +642,8 @@ class MaintenanceWorkOrder(Base):
             "assigned_to": self.assigned_to,
             "assignee_skills": self.assignee_skills,
             "assigned_at": self.assigned_at.isoformat() if self.assigned_at else None,
+            "estimated_arrival": self.estimated_arrival.isoformat() if self.estimated_arrival else None,
+            "estimated_completion": self.estimated_completion.isoformat() if self.estimated_completion else None,
             "scheduled_at": self.scheduled_at.isoformat() if self.scheduled_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -885,6 +890,49 @@ class SafetyOfficer(Base):
             "status": self.status,
             "current_vehicle_id": self.current_vehicle_id,
             "workload": self.workload,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class AccidentDisposalStep(Base):
+    __tablename__ = "accident_disposal_steps"
+
+    id = Column(Integer, primary_key=True)
+    accident_id = Column(Integer, ForeignKey("accident_reports.id"), nullable=False, index=True)
+    step_name = Column(String(50), nullable=False, index=True)
+    attempt_number = Column(Integer, default=1)
+    status = Column(String(20), nullable=False)
+    message = Column(Text)
+    error = Column(Text)
+    result_data = Column(JSON)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    accident = relationship("AccidentReport", back_populates="disposal_steps")
+
+    __table_args__ = (
+        UniqueConstraint("accident_id", "step_name", "attempt_number", name="uq_accident_step_attempt"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "accident_id": self.accident_id,
+            "step_name": self.step_name,
+            "attempt_number": self.attempt_number,
+            "status": self.status,
+            "message": self.message,
+            "error": self.error,
+            "result_data": self.result_data,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_seconds": (
+                (self.completed_at - self.started_at).total_seconds()
+                if self.started_at and self.completed_at else None
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None
         }

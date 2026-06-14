@@ -191,3 +191,45 @@ class AccidentOneClickResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DisposalStepHistory(BaseModel):
+    id: int
+    step_name: str
+    attempt_number: int
+    status: str
+    message: Optional[str] = None
+    error: Optional[str] = None
+    result_data: Optional[Dict[str, Any]] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AccidentDisposalDetailResponse(BaseModel):
+    accident_id: int
+    report_number: str
+    overall_status: str
+    all_succeeded: bool
+    failed_step: Optional[str] = None
+    total_attempts: int
+    timeline: List[DisposalStepHistory]
+
+    class Config:
+        from_attributes = True
+
+
+class StepRetryResponse(BaseModel):
+    accident_id: int
+    step_name: str
+    attempt_number: int
+    status: str
+    success: bool
+    message: str
+    error: Optional[str] = None
+    result_data: Optional[Dict[str, Any]] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
