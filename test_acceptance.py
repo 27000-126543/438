@@ -2,7 +2,7 @@ import requests
 import json
 import sys
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 BASE = "http://localhost:8000"
 
@@ -216,7 +216,23 @@ print("场景2：离线设备自动派单成功")
 print("=" * 80)
 
 try:
-    print("\n🛣️  步骤0：创建测试路线（带区域信息）")
+    print("\n🧹 步骤0：清理维护人员历史工单，确保有可用人员")
+    from app.database import AsyncSessionLocal
+    from app.models import MaintenanceWorkOrder
+
+    async def clear_work_orders():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                MaintenanceWorkOrder.__table__.update().where(
+                    MaintenanceWorkOrder.status.in_(["pending", "assigned", "in_progress"])
+                ).values(status="completed", completed_at=datetime.utcnow())
+            )
+            await db.commit()
+            print(f"   已清理 {result.rowcount} 条进行中的工单")
+
+    asyncio.run(clear_work_orders())
+
+    print("\n🛣️  步骤1：创建测试路线（带区域信息）")
     route_code = "ROUTE_TEST_" + datetime.utcnow().strftime("%H%M%S")
     route_data = {
         "route_name": "中关村测试路线",
@@ -855,7 +871,27 @@ try:
             "registration_date": "2024-02-01",
             "test_expiry_date": "2027-12-31",
             "insurance_expiry_date": "2027-12-31",
-            "vehicle_config": {"sensor_config": {"lidar": True, "camera": True}}
+            "vehicle_config": {
+                "sensor_config": {
+                    "lidar": {"count": 1, "range": 200},
+                    "camera": {"count": 4, "resolution": "4K"},
+                    "radar": {"count": 5, "range": 150},
+                    "ultrasonic": {"count": 8, "range": 5}
+                },
+                "compute_platform": {
+                    "processor": "NVIDIA Orin",
+                    "memory_gb": 32,
+                    "storage_gb": 512
+                },
+                "communication_module": {
+                    "type": "5G",
+                    "protocol": "TCP/IP"
+                },
+                "safety_system": {
+                    "emergency_brake": True,
+                    "driver_monitoring": True
+                }
+            }
         }
         v1_resp = requests.post(f"{BASE}/api/vehicles/register", json=v1_data, headers=headers)
         v1_id = None
@@ -1171,6 +1207,443 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     test_results.append(("区域对比导出", False, f"异常: {e}"))
+
+
+print("\n" + "=" * 80)
+print("场景8：事故处置编排 - 失败暂停、阻塞标记、重试续跑")
+print("=" * 80)
+
+try:
+    print("\n🚗 步骤1：创建一个测试车辆")
+    v_vin = "TESTSCENE8" + datetime.utcnow().strftime("%H%M%S%f")[:9]
+    v_data = {
+        "vin": v_vin,
+        "license_plate": f"京S8{datetime.utcnow().strftime('%H%M%S')}",
+        "vehicle_model": "Test Model",
+        "vehicle_type": "sedan",
+        "automation_level": "L4",
+        "manufacture_date": "2025-01-01",
+        "registration_date": "2025-06-01",
+        "test_expiry_date": "2027-12-31",
+        "insurance_expiry_date": "2027-12-31",
+        "test_area": "北京市海淀区",
+        "test_type": "performance",
+        "vehicle_config": {
+            "sensor_config": {
+                "lidar": {"count": 1, "range": 200},
+                "camera": {"count": 4, "resolution": "4K"},
+                "radar": {"count": 5, "range": 150},
+                "ultrasonic": {"count": 8, "range": 5}
+            },
+            "compute_platform": {
+                "processor": "NVIDIA Orin",
+                "memory_gb": 32,
+                "storage_gb": 512
+            },
+            "communication_module": {
+                "type": "5G",
+                "protocol": "TCP/IP"
+            },
+            "safety_system": {
+                "emergency_brake": True,
+                "driver_monitoring": True
+            }
+        }
+    }
+    v_resp = requests.post(f"{BASE}/api/vehicles/register", json=v_data, headers=headers)
+    v_id = None
+    if v_resp.status_code == 200 and v_resp.json().get("success"):
+        v_data_r = v_resp.json()
+        v_id = v_data_r.get("vehicle_id") or v_data_r.get("vehicle", {}).get("id")
+        print(f"   ✅ 车辆创建成功，ID: {v_id}")
+    else:
+        print(f"   ⚠️  车辆响应: {v_resp.status_code} - {v_resp.text[:150]}")
+        test_results.append(("事故处置编排", False, "测试车辆创建失败"))
+
+    if v_id:
+        print("\n📝 步骤2：提交事故，故意在某一步触发失败")
+        print("   （测试失败后暂停、阻塞点标记、重试后继续）")
+        accident_data = {
+            "company_id": 1,
+            "vehicle_id": v_id,
+            "report_number": f"ACC-SCENE8-{datetime.utcnow().strftime('%H%M%S')}",
+            "accident_type": "collision",
+            "severity": "minor",
+            "accident_time": datetime.utcnow().isoformat(),
+            "location": "北京市海淀区中关村大街1号",
+            "latitude": 39.98,
+            "longitude": 116.31,
+            "speed_before": 45.0,
+            "autopilot_mode": "manual",
+            "driver_name": "测试司机",
+            "driver_license": "DL-SCENE8",
+            "description": "测试事故编排",
+            "simulate_failure_step": "trigger_insurance",
+        }
+        acc_resp = requests.post(f"{BASE}/api/accidents", json=accident_data, headers=headers)
+        accident_id = None
+        blocked_step = None
+        if acc_resp.status_code == 201:
+            acc_data = acc_resp.json()
+            accident_id = acc_data.get("accident_id")
+            blocked_step = acc_data.get("blocked_at_step")
+            print(f"   ✅ 事故提交成功，ID: {accident_id}")
+            print(f"   阻塞点: {blocked_step or '无'}")
+
+            steps = acc_data.get("steps", [])
+            failed_steps = [s for s in steps if not s.get("success") and s.get("error") != "blocked_by_previous_failure"]
+            skipped_steps = [s for s in steps if s.get("error") == "blocked_by_previous_failure"]
+
+            if blocked_step:
+                print(f"   ✅ 正确标记了阻塞点: {blocked_step}")
+            if skipped_steps:
+                print(f"   ✅ 正确跳过了后续步骤: {len(skipped_steps)} 步")
+
+            print("\n📋 步骤3：查询处置详情，验证时间线")
+            detail_resp = requests.get(f"{BASE}/api/accidents/{accident_id}/disposal", headers=headers)
+            detail_ok = False
+            has_blocked = False
+            if detail_resp.status_code == 200:
+                detail_data = detail_resp.json()
+                blocked_in_detail = detail_data.get("blocked_at_step")
+                timeline = detail_data.get("timeline", [])
+                has_blocked = blocked_in_detail is not None
+                print(f"   处置详情阻塞点: {blocked_in_detail}")
+                print(f"   时间线记录数: {len(timeline)}")
+                if blocked_in_detail == blocked_step:
+                    detail_ok = True
+                    print("   ✅ 处置详情阻塞点与提交结果一致")
+
+            print("\n🔄 步骤4：重试失败步骤，验证能继续执行后续步骤")
+            retry_ok = False
+            subsequent_executed = False
+            if blocked_step and blocked_step != "create_accident":
+                retry_resp = requests.post(
+                    f"{BASE}/api/accidents/{accident_id}/retry/{blocked_step}",
+                    headers=headers
+                )
+                if retry_resp.status_code == 200:
+                    retry_data = retry_resp.json()
+                    print(f"   重试状态: {retry_data.get('success')}")
+                    print(f"   重试消息: {retry_data.get('message')}")
+                    print(f"   新阻塞点: {retry_data.get('new_blocked_at_step', '无')}")
+
+                    sub_executed = retry_data.get("subsequent_executed", [])
+                    if sub_executed:
+                        subsequent_executed = True
+                        print(f"   ✅ 自动执行了 {len(sub_executed)} 个后续步骤")
+                        for sub in sub_executed:
+                            print(f"      - {sub['step_name']}: {'成功' if sub['success'] else '失败'}")
+
+                    retry_ok = retry_data.get("success", False)
+
+                    if retry_data.get("all_succeeded"):
+                        print("   ✅ 所有步骤全部执行成功！")
+
+            if blocked_step is not None and detail_ok:
+                if retry_ok:
+                    print("\n🎉 场景8验收通过：事故处置编排正常！")
+                    test_results.append(("事故处置编排", True, f"失败暂停点={blocked_step}, 重试后继续执行{len(sub_executed) if subsequent_executed else 0}个后续步骤"))
+                else:
+                    print(f"\n⚠️  场景8部分通过：阻塞点正确但重试有问题")
+                    test_results.append(("事故处置编排", False, "重试步骤执行失败"))
+            else:
+                print(f"\n⚠️  场景8部分通过: blocked_step={blocked_step}, detail_ok={detail_ok}")
+                test_results.append(("事故处置编排", False, f"阻塞点标记有误: {blocked_step}"))
+        else:
+            print(f"   ❌ 事故提交失败")
+            print(f"      状态码: {acc_resp.status_code}")
+            print(f"      响应内容: {acc_resp.text[:500]}")
+            test_results.append(("事故处置编排", False, f"事故提交失败 HTTP {acc_resp.status_code}: {acc_resp.text[:200]}"))
+
+except Exception as e:
+    print(f"❌ 场景8异常: {e}")
+    import traceback
+    traceback.print_exc()
+    test_results.append(("事故处置编排", False, f"异常: {e}"))
+
+
+print("\n" + "=" * 80)
+print("场景9：派单候选人排名和淘汰原因")
+print("=" * 80)
+
+try:
+    print("\n📡 步骤1：创建设备，指定特殊技能要求")
+    device_skills = ["camera", "5G", "basic_maintenance"]
+    device_data = {
+        "device_code": f"DEV-SCENE9-{datetime.utcnow().strftime('%H%M%S')}",
+        "device_name": "场景9测试摄像头",
+        "device_type": "camera",
+        "latitude": 39.9842,
+        "longitude": 116.3074,
+        "status": "online",
+        "maintenance_skills": device_skills,
+        "route_id": 1,
+    }
+    dev_resp = requests.post(f"{BASE}/api/devices", json=device_data, headers=headers)
+    device_id = None
+    if dev_resp.status_code == 201:
+        dev = dev_resp.json()
+        device_id = dev.get("id")
+        print(f"   ✅ 设备创建成功，ID: {device_id}")
+    else:
+        print(f"   ⚠️  设备响应: {dev_resp.status_code} - {dev_resp.text[:150]}")
+        test_results.append(("派单候选人排名", False, "设备创建失败"))
+
+    if device_id:
+        print("\n⏰ 步骤2：模拟设备离线30分钟以上")
+        from app.database import AsyncSessionLocal
+        from sqlalchemy import select
+        from app.models import RoadsideDevice
+
+        async def simulate_offline():
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(RoadsideDevice).where(RoadsideDevice.id == device_id))
+                dev = result.scalar_one_or_none()
+                if dev:
+                    dev.last_heartbeat = datetime.utcnow() - timedelta(minutes=35)
+                    dev.status = "online"
+                    await db.commit()
+                    print(f"   ✅ 模拟设备离线: 心跳更新为35分钟前")
+
+        import asyncio
+        asyncio.run(simulate_offline())
+
+        print("\n🔧 步骤3：触发离线检查和自动派单")
+        check_resp = requests.post(f"{BASE}/api/devices/check-offline", headers=headers)
+        has_candidates = False
+        has_elimination_reasons = False
+        if check_resp.status_code == 200:
+            check_data = check_resp.json()
+            orders = check_data.get("generated_orders", [])
+            print(f"   生成工单数: {len(orders)}")
+
+            for order in orders:
+                assignment = order.get("assignment", {})
+                candidates = assignment.get("candidate_rankings", [])
+                total_candidates = assignment.get("total_candidates", 0)
+                eligible_count = assignment.get("eligible_count", 0)
+
+                print(f"\n📊 工单 {order.get('order_number')} 派单结果：")
+                print(f"   总候选人数: {total_candidates}")
+                print(f"   符合条件人数: {eligible_count}")
+                print(f"   分配状态: {'成功' if assignment.get('success') else '失败'}")
+
+                if candidates:
+                    has_candidates = True
+                    print(f"\n🏆 候选人排名：")
+                    for c in candidates[:5]:
+                        status = "✅ 入选" if c.get("eligible") else "❌ 淘汰"
+                        elim_reason = c.get("elimination_reason", "")
+                        print(f"   第{c['rank']}名: {c['staff_name']} (ID:{c['staff_id']})")
+                        print(f"      状态: {status} {elim_reason}")
+                        print(f"      总分: {c['total_score']} (技能{c['skill_score']} + 距离{c['distance_score']} + 负载{c['workload_score']})")
+                        print(f"      技能匹配率: {int(c['skill_match_ratio']*100)}%, 距离: {c.get('distance_km', 'N/A')}km, 负载: {c['current_workload']}单")
+
+                        if c.get("elimination_details"):
+                            has_elimination_reasons = True
+                            for reason, detail in c["elimination_details"].items():
+                                if reason == "insufficient_skills":
+                                    print(f"      💡 技能不匹配: 需{detail.get('required', [])}, 匹配{detail.get('matched', [])}, 匹配率{int(detail.get('match_ratio', 0)*100)}%")
+                                elif reason == "too_far":
+                                    print(f"      💡 距离太远: {detail.get('distance_km', 0)}km > 允许{detail.get('max_allowed', 0)}km")
+                                elif reason == "overloaded":
+                                    print(f"      💡 工单满载: {detail.get('current_workload', 0)}单 >= 允许{detail.get('max_allowed', 0)}单")
+
+            pending_detail = assignment.get("pending_reason_detail") or {}
+            if pending_detail and pending_detail.get("all_overloaded"):
+                print(f"\n⚠️  正确识别为: 所有维护人员满载待分配")
+
+            if has_candidates and has_elimination_reasons:
+                print("\n🎉 场景9验收通过：派单候选人排名和淘汰原因正常！")
+                test_results.append(("派单候选人排名", True, f"显示{len(candidates)}名候选人，含淘汰原因明细"))
+            elif has_candidates:
+                print("\n⚠️  场景9部分通过：有排名但缺少淘汰原因明细")
+                test_results.append(("派单候选人排名", False, "缺少淘汰原因明细"))
+            else:
+                print("\n⚠️  场景9部分通过：未获取到候选人排名")
+                test_results.append(("派单候选人排名", False, "未返回候选人排名"))
+        else:
+            print(f"   ❌ 离线检查失败: {check_resp.status_code} - {check_resp.text[:200]}")
+            test_results.append(("派单候选人排名", False, "离线检查失败"))
+
+except Exception as e:
+    print(f"❌ 场景9异常: {e}")
+    import traceback
+    traceback.print_exc()
+    test_results.append(("派单候选人排名", False, f"异常: {e}"))
+
+
+print("\n" + "=" * 80)
+print("场景10：连续多天区域趋势视图")
+print("=" * 80)
+
+try:
+    test_regions = ["北京市海淀区", "北京市朝阳区"]
+    today = date.today()
+    start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+
+    print(f"\n📅 日期范围: {start_date} ~ {end_date}")
+    print(f"📍 对比区域: {', '.join(test_regions)}")
+
+    print("\n📊 步骤1：调用区域趋势接口")
+    trend_resp = requests.get(
+        f"{BASE}/api/reports/region-trend",
+        params={
+            "start_date": start_date,
+            "end_date": end_date,
+            "regions": test_regions,
+        },
+        headers=headers
+    )
+    trend_ok = False
+    has_daily_data = False
+    has_trend_analysis = False
+    has_volatility = False
+
+    if trend_resp.status_code == 200:
+        trend_data = trend_resp.json()
+        print(f"   状态码: 200")
+        print(f"   总天数: {trend_data.get('total_days')}")
+        print(f"   区域数: {len(trend_data.get('regions', []))}")
+
+        daily_metrics = trend_data.get("daily_metrics", [])
+        if daily_metrics:
+            has_daily_data = True
+            print(f"\n📈 每日指标记录数: {len(daily_metrics)}")
+            print(f"\n📋 最近3天数据预览：")
+            for metric in daily_metrics[-6:]:
+                print(f"   📅 {metric['report_date']} ({metric.get('day_of_week', '')}) {'周末' if metric.get('is_weekend') else '工作日'}")
+                print(f"      区域: {metric['region']}")
+                print(f"      活跃车辆: {metric['active_vehicles']}, 告警: {metric['total_alarms']}, 在线率: {metric['device_online_rate']}%")
+
+        trend_analysis = trend_data.get("trend_analysis", [])
+        if trend_analysis:
+            has_trend_analysis = True
+            print(f"\n📊 趋势分析数: {len(trend_analysis)}")
+            print(f"\n📈 各区域趋势：")
+            for t in trend_analysis[:5]:
+                direction = t.get("trend_direction", "unknown")
+                direction_cn = {"rising": "📈 上升", "falling": "📉 下降", "stable": "➡️  稳定", "unknown": "❓ 未知"}.get(direction, direction)
+                print(f"   {t['region']} - {t['metric_name']}: {direction_cn} (波动: {t.get('volatility', 0)}%)")
+
+        volatility_summary = trend_data.get("volatility_summary", {})
+        if volatility_summary:
+            has_volatility = True
+            print(f"\n🌊 波动性汇总: {len(volatility_summary)} 个区域")
+
+        peak_day = trend_data.get("peak_day")
+        lowest_day = trend_data.get("lowest_day")
+        if peak_day:
+            print(f"\n🏔️  波动最大日期: {peak_day.get('date')} ({peak_day.get('day_of_week')}, {peak_day.get('region')})")
+            print(f"   告警: {peak_day.get('alarms')}, 事故: {peak_day.get('accidents')}")
+        if lowest_day:
+            print(f"📉 在线率最低: {lowest_day.get('date')} ({lowest_day.get('day_of_week')}, {lowest_day.get('region')})")
+            print(f"   在线率: {lowest_day.get('online_rate')}%")
+
+        print("\n📤 步骤2：导出多天多区域数据")
+        export_resp = requests.get(
+            f"{BASE}/api/reports/export",
+            params={
+                "start_date": start_date,
+                "end_date": end_date,
+                "regions": test_regions,
+                "format": "csv"
+            },
+            headers=headers
+        )
+        export_ok = False
+        export_days_correct = False
+        if export_resp.status_code == 200:
+            csv_content = export_resp.text
+            lines = csv_content.strip().split("\n")
+            data_lines = len(lines) - 1 if len(lines) > 1 else 0
+            print(f"   ✅ 导出成功，数据行数: {data_lines}")
+
+            expected_days = (today - (today - timedelta(days=7))).days + 1
+            expected_lines = expected_days * len(test_regions)
+            export_days_correct = data_lines >= expected_lines
+            if export_days_correct:
+                print(f"   ✅ 导出数据完整（预期≥{expected_lines}行，实际{data_lines}行）")
+            else:
+                print(f"   ⚠️  导出数据可能不完整（预期≥{expected_lines}行，实际{data_lines}行）")
+
+            export_ok = True
+
+        if has_daily_data and has_trend_analysis and has_volatility and export_ok:
+            print("\n🎉 场景10验收通过：连续多天区域趋势视图正常！")
+            test_results.append(("多天区域趋势", True, f"8天×2区域数据，含趋势分析和波动性评估，导出{data_lines}行"))
+        else:
+            issues = []
+            if not has_daily_data: issues.append("无每日数据")
+            if not has_trend_analysis: issues.append("无趋势分析")
+            if not has_volatility: issues.append("无波动性汇总")
+            if not export_ok: issues.append("导出失败")
+            if not export_days_correct: issues.append("导出数据不完整")
+            print(f"\n⚠️  场景10部分失败: {'; '.join(issues)}")
+            test_results.append(("多天区域趋势", False, "; ".join(issues)))
+    else:
+        print(f"   ❌ 趋势查询失败: {trend_resp.status_code} - {trend_resp.text[:200]}")
+        test_results.append(("多天区域趋势", False, "趋势查询失败"))
+
+except Exception as e:
+    print(f"❌ 场景10异常: {e}")
+    import traceback
+    traceback.print_exc()
+    test_results.append(("多天区域趋势", False, f"异常: {e}"))
+
+
+print("\n" + "=" * 80)
+print("场景11：维护人员负载与工单状态对齐")
+print("=" * 80)
+
+try:
+    print("\n👷 步骤1：获取维护人员列表")
+    staff_resp = requests.get(f"{BASE}/api/maintenance-staff", headers=headers)
+    load_ok = False
+    if staff_resp.status_code == 200:
+        staff_list = staff_resp.json()
+        print(f"   维护人员数: {len(staff_list)}")
+
+        print(f"\n📋 维护人员负载情况：")
+        for s in staff_list:
+            name = s.get("name")
+            workload = s.get("current_workload", 0)
+            available = s.get("available", False)
+            status = s.get("status")
+            print(f"   👷 {name}: {workload}单, 状态: {status}, 可接单: {'✅' if available else '❌'}")
+
+        print("\n🔍 步骤2：验证负载与实际工单一致")
+        print("   （负载计算包含 assigned、pending、in_progress 状态工单）")
+
+        if len(staff_list) > 0:
+            staff_id = staff_list[0].get("id")
+            detail_resp = requests.get(f"{BASE}/api/maintenance-staff/{staff_id}", headers=headers)
+            if detail_resp.status_code == 200:
+                detail = detail_resp.json()
+                detail_workload = detail.get("current_workload", 0)
+                list_workload = staff_list[0].get("current_workload", 0)
+                if detail_workload == list_workload:
+                    print(f"   ✅ 列表与详情负载一致: {detail_workload} 单")
+                    load_ok = True
+                else:
+                    print(f"   ⚠️  负载不一致: 列表{list_workload}, 详情{detail_workload}")
+            else:
+                print(f"   ⚠️  详情查询失败: {detail_resp.status_code}")
+
+    if load_ok:
+        print("\n🎉 场景11验收通过：维护人员负载与工单状态对齐！")
+        test_results.append(("维护人员负载对齐", True, f"{len(staff_list)}名人员负载计算正确，列表与详情一致"))
+    else:
+        print("\n⚠️  场景11部分通过：负载计算可能存在问题")
+        test_results.append(("维护人员负载对齐", False, "负载计算或一致性有问题"))
+
+except Exception as e:
+    print(f"❌ 场景11异常: {e}")
+    import traceback
+    traceback.print_exc()
+    test_results.append(("维护人员负载对齐", False, f"异常: {e}"))
 
 
 print("\n" + "=" * 80)

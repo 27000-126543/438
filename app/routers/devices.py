@@ -191,6 +191,8 @@ async def auto_assign_work_order(
     device: RoadsideDevice,
     db: AsyncSession
 ):
+    from app.schemas.device import CandidateRanking
+
     required_skills = set(order.required_skills or [])
     priority = order.priority or "normal"
 
@@ -216,24 +218,37 @@ async def auto_assign_work_order(
                 "distance_ok_count": 0,
                 "workload_ok_count": 0,
                 "qualification_note": f"资格筛选：技能匹配率>={int(MIN_SKILL_MATCH_RATIO*100)}%, 距离<={MAX_DISTANCE_KM}km, 负载<={MAX_WORKLOAD}单"
-            }
+            },
+            "candidate_rankings": [],
+            "total_candidates": 0,
+            "eligible_count": 0
         }
 
     no_skill_count = 0
     too_far_count = 0
     overloaded_count = 0
-    eligible_staff = []
+    all_scored = []
 
     for staff in all_staff:
         staff_skills = set(staff.skills or [])
+        elimination_reasons = []
+        elimination_details = {}
         is_eligible = True
 
+        skill_match_ratio = 1.0
         if required_skills:
             matched = len(required_skills & staff_skills)
-            skill_ratio = matched / len(required_skills) if required_skills else 1.0
-            if skill_ratio < MIN_SKILL_MATCH_RATIO:
+            skill_match_ratio = matched / len(required_skills) if required_skills else 1.0
+            if skill_match_ratio < MIN_SKILL_MATCH_RATIO:
                 no_skill_count += 1
                 is_eligible = False
+                elimination_reasons.append("技能不匹配")
+                elimination_details["insufficient_skills"] = {
+                    "required": list(required_skills),
+                    "matched": list(required_skills & staff_skills),
+                    "match_ratio": round(skill_match_ratio, 2),
+                    "min_required": MIN_SKILL_MATCH_RATIO
+                }
 
         distance = None
         if device and staff.current_latitude and staff.current_longitude and device.latitude and device.longitude:
@@ -246,63 +261,27 @@ async def auto_assign_work_order(
             if distance > MAX_DISTANCE_KM:
                 too_far_count += 1
                 is_eligible = False
+                elimination_reasons.append("距离太远")
+                elimination_details["too_far"] = {
+                    "distance_km": round(distance, 2),
+                    "max_allowed": MAX_DISTANCE_KM
+                }
 
         if staff.workload >= MAX_WORKLOAD:
             overloaded_count += 1
             is_eligible = False
+            elimination_reasons.append("工单满载")
+            elimination_details["overloaded"] = {
+                "current_workload": staff.workload,
+                "max_allowed": MAX_WORKLOAD
+            }
 
-        if is_eligible:
-            eligible_staff.append((staff, distance))
-
-    if not eligible_staff:
-        pending_detail = {
-            "no_staff": len(all_staff) == 0,
-            "insufficient_skills": no_skill_count,
-            "too_far": too_far_count,
-            "workload_full": overloaded_count,
-            "available_count": len(all_staff),
-            "skill_match_count": len(all_staff) - no_skill_count,
-            "distance_ok_count": len(all_staff) - too_far_count,
-            "workload_ok_count": len(all_staff) - overloaded_count,
-            "qualification_note": f"资格筛选：技能匹配率>={int(MIN_SKILL_MATCH_RATIO*100)}%, 距离<={MAX_DISTANCE_KM}km, 负载<={MAX_WORKLOAD}单"
-        }
-
-        reasons = []
-        if no_skill_count > 0:
-            reasons.append(f"{no_skill_count} 人技能不匹配（最低要求匹配 {int(MIN_SKILL_MATCH_RATIO*100)}% 技能）")
-        if too_far_count > 0:
-            reasons.append(f"{too_far_count} 人距离超过 {MAX_DISTANCE_KM} 公里")
-        if overloaded_count > 0:
-            reasons.append(f"{overloaded_count} 人工单已达 {MAX_WORKLOAD} 单上限")
-
-        reason_code = "mixed"
-        if pending_detail["insufficient_skills"] > 0 and pending_detail["too_far"] == 0 and pending_detail["workload_full"] == 0:
-            reason_code = "insufficient_skills"
-        elif pending_detail["too_far"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["workload_full"] == 0:
-            reason_code = "too_far"
-        elif pending_detail["workload_full"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["too_far"] == 0:
-            reason_code = "overloaded"
-
-        return {
-            "success": False,
-            "reason": reason_code,
-            "message": "没有符合条件的维护人员：" + "；".join(reasons),
-            "pending_reason_detail": pending_detail
-        }
-
-    scored_staff = []
-    for staff, distance in eligible_staff:
         score = 0.0
-        staff_skills = set(staff.skills or [])
-
         skill_score = 0.0
         distance_score = 0.0
         workload_score = 0.0
-        skill_match_ratio = 1.0
 
         if required_skills:
-            matched = len(required_skills & staff_skills)
-            skill_match_ratio = matched / len(required_skills) if required_skills else 1.0
             skill_score = skill_match_ratio * 60
         else:
             skill_score = 60
@@ -317,7 +296,7 @@ async def auto_assign_work_order(
         workload_score = max(0.0, 1.0 - staff.workload / MAX_WORKLOAD) * 10
         score += workload_score
 
-        scored_staff.append({
+        all_scored.append({
             "staff": staff,
             "score": score,
             "skill_score": skill_score,
@@ -325,11 +304,82 @@ async def auto_assign_work_order(
             "workload_score": workload_score,
             "skill_match_ratio": skill_match_ratio,
             "distance_km": distance,
-            "current_workload": staff.workload
+            "current_workload": staff.workload,
+            "eligible": is_eligible,
+            "elimination_reason": "、".join(elimination_reasons) if elimination_reasons else None,
+            "elimination_details": elimination_details if elimination_details else None
         })
 
-    scored_staff.sort(key=lambda x: x["score"], reverse=True)
-    best = scored_staff[0]
+    all_scored.sort(key=lambda x: (x["eligible"], x["score"]), reverse=True)
+
+    candidate_rankings = []
+    for i, s in enumerate(all_scored):
+        candidate_rankings.append(CandidateRanking(
+            staff_id=s["staff"].id,
+            staff_name=s["staff"].name,
+            rank=i + 1,
+            total_score=round(s["score"], 2),
+            skill_score=round(s["skill_score"], 2),
+            distance_score=round(s["distance_score"], 2),
+            workload_score=round(s["workload_score"], 2),
+            skill_match_ratio=round(s["skill_match_ratio"], 2),
+            distance_km=round(s["distance_km"], 2) if s["distance_km"] else None,
+            current_workload=s["current_workload"],
+            eligible=s["eligible"],
+            elimination_reason=s["elimination_reason"],
+            elimination_details=s["elimination_details"]
+        ))
+
+    eligible_staff = [s for s in all_scored if s["eligible"]]
+
+    if not eligible_staff:
+        all_overloaded = overloaded_count == len(all_staff)
+        reason_code = "all_overloaded" if all_overloaded else "mixed"
+
+        pending_detail = {
+            "no_staff": len(all_staff) == 0,
+            "insufficient_skills": no_skill_count,
+            "too_far": too_far_count,
+            "workload_full": overloaded_count,
+            "available_count": len(all_staff),
+            "skill_match_count": len(all_staff) - no_skill_count,
+            "distance_ok_count": len(all_staff) - too_far_count,
+            "workload_ok_count": len(all_staff) - overloaded_count,
+            "qualification_note": f"资格筛选：技能匹配率>={int(MIN_SKILL_MATCH_RATIO*100)}%, 距离<={MAX_DISTANCE_KM}km, 负载<={MAX_WORKLOAD}单",
+            "all_overloaded": all_overloaded
+        }
+
+        reasons = []
+        if no_skill_count > 0:
+            reasons.append(f"{no_skill_count} 人技能不匹配（最低要求匹配 {int(MIN_SKILL_MATCH_RATIO*100)}% 技能）")
+        if too_far_count > 0:
+            reasons.append(f"{too_far_count} 人距离超过 {MAX_DISTANCE_KM} 公里")
+        if overloaded_count > 0:
+            reasons.append(f"{overloaded_count} 人工单已达 {MAX_WORKLOAD} 单上限")
+
+        if all_overloaded:
+            message = f"所有 {len(all_staff)} 名维护人员工单已满，当前最大负载 {MAX_WORKLOAD} 单，工单已留待分配"
+            reason_code = "all_overloaded"
+        else:
+            message = "没有符合条件的维护人员：" + "；".join(reasons)
+            if pending_detail["insufficient_skills"] > 0 and pending_detail["too_far"] == 0 and pending_detail["workload_full"] == 0:
+                reason_code = "insufficient_skills"
+            elif pending_detail["too_far"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["workload_full"] == 0:
+                reason_code = "too_far"
+            elif pending_detail["workload_full"] > 0 and pending_detail["insufficient_skills"] == 0 and pending_detail["too_far"] == 0:
+                reason_code = "overloaded"
+
+        return {
+            "success": False,
+            "reason": reason_code,
+            "message": message,
+            "pending_reason_detail": pending_detail,
+            "candidate_rankings": candidate_rankings,
+            "total_candidates": len(all_staff),
+            "eligible_count": 0
+        }
+
+    best = eligible_staff[0]
     staff = best["staff"]
     distance = best["distance_km"]
 
@@ -338,6 +388,7 @@ async def auto_assign_work_order(
     estimated_completion = estimated_arrival + timedelta(minutes=ESTIMATED_REPAIR_MINUTES)
 
     order.assigned_to = staff.name
+    order.assignee_id = staff.id
     order.assignee_skills = staff.skills
     order.assigned_at = datetime.utcnow()
     order.status = "assigned"
@@ -379,7 +430,10 @@ async def auto_assign_work_order(
         "estimated_completion_time": estimated_completion.isoformat(),
         "assignment_basis": assignment_basis,
         "escalation_rules": generate_escalation_rules(priority),
-        "pending_reason_detail": None
+        "pending_reason_detail": None,
+        "candidate_rankings": candidate_rankings,
+        "total_candidates": len(all_staff),
+        "eligible_count": len(eligible_staff)
     }
 
 
@@ -504,7 +558,7 @@ async def list_devices(
     return devices
 
 
-@router.post("", summary="创建设备", response_model=RoadsideDeviceResponse)
+@router.post("", summary="创建设备", response_model=RoadsideDeviceResponse, status_code=status.HTTP_201_CREATED)
 async def create_device(
     data: RoadsideDeviceCreate,
     db: AsyncSession = Depends(get_db),

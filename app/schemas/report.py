@@ -182,3 +182,51 @@ class RegionComparisonResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DailyRegionMetrics(BaseModel):
+    report_date: date
+    region: str
+    total_vehicles: int
+    active_vehicles: int
+    total_test_distance: float
+    total_alarms: int
+    critical_alarms: int
+    accident_rate: float
+    total_devices: int
+    online_devices: int
+    device_online_rate: float
+    new_accidents: int
+    day_of_week: Optional[str] = None
+    is_weekend: Optional[bool] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TrendAnalysis(BaseModel):
+    metric_name: str
+    region: str
+    values: List[Dict[str, Any]]
+    max_value: Optional[float] = None
+    min_value: Optional[float] = None
+    avg_value: Optional[float] = None
+    max_date: Optional[date] = None
+    min_date: Optional[date] = None
+    volatility: Optional[float] = None
+    trend_direction: Optional[str] = None
+
+
+class RegionTrendResponse(BaseModel):
+    start_date: date
+    end_date: date
+    regions: List[str]
+    total_days: int
+    daily_metrics: List[DailyRegionMetrics]
+    trend_analysis: List[TrendAnalysis]
+    volatility_summary: Dict[str, Any]
+    peak_day: Optional[Dict[str, Any]] = None
+    lowest_day: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True

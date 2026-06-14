@@ -32,16 +32,22 @@ async def list_maintenance_staff(
         workload_result = await db.execute(
             select(func.count(MaintenanceWorkOrder.id)).where(
                 and_(
-                    MaintenanceWorkOrder.assigned_to == staff.id,
-                    MaintenanceWorkOrder.status.in_(["pending", "in_progress"])
+                    MaintenanceWorkOrder.assignee_id == staff.id,
+                    MaintenanceWorkOrder.status.in_(["pending", "assigned", "in_progress"])
                 )
             )
         )
-        workload = workload_result.scalar() or 0
+        actual_workload = workload_result.scalar() or 0
+
+        if staff.workload != actual_workload:
+            staff.workload = actual_workload
+            staff.updated_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(staff)
 
         staff_dict = staff.to_dict()
-        staff_dict["current_workload"] = workload
-        staff_dict["available"] = staff.status == "active" and workload < 8
+        staff_dict["current_workload"] = actual_workload
+        staff_dict["available"] = staff.status in ["available", "on_duty"] and actual_workload < 8
         staff_dicts.append(staff_dict)
 
     return staff_dicts
@@ -62,15 +68,22 @@ async def get_maintenance_staff(
     workload_result = await db.execute(
         select(func.count(MaintenanceWorkOrder.id)).where(
             and_(
-                MaintenanceWorkOrder.assigned_to == staff_id,
-                MaintenanceWorkOrder.status.in_(["pending", "in_progress"])
+                MaintenanceWorkOrder.assignee_id == staff_id,
+                MaintenanceWorkOrder.status.in_(["pending", "assigned", "in_progress"])
             )
         )
     )
-    workload = workload_result.scalar() or 0
+    actual_workload = workload_result.scalar() or 0
+
+    if staff.workload != actual_workload:
+        staff.workload = actual_workload
+        staff.updated_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(staff)
 
     staff_dict = staff.to_dict()
-    staff_dict["current_workload"] = workload
+    staff_dict["current_workload"] = actual_workload
+    staff_dict["available"] = staff.status in ["available", "on_duty"] and actual_workload < 8
     return staff_dict
 
 

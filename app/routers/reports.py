@@ -33,6 +33,9 @@ from app.schemas.report import (
     MultiDimensionReport,
     RegionMetrics,
     RegionComparisonResponse,
+    DailyRegionMetrics,
+    TrendAnalysis,
+    RegionTrendResponse,
 )
 
 router = APIRouter(tags=["运营报表"])
@@ -769,6 +772,312 @@ async def compare_regions(
         regions=regions_list,
         metrics=all_metrics,
         comparison_summary=comparison_summary
+    )
+
+
+async def calculate_region_metrics_for_date(
+    db: AsyncSession,
+    target_date: date,
+    region: str,
+    company_id: Optional[int] = None
+) -> DailyRegionMetrics:
+    from app.schemas.report import DailyRegionMetrics
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+
+    vehicles_query = select(TestVehicle)
+    if company_id:
+        vehicles_query = vehicles_query.where(TestVehicle.company_id == company_id)
+    vehicles_query = vehicles_query.where(TestVehicle.test_area == region)
+    vehicles_result = await db.execute(vehicles_query)
+    all_vehicles = vehicles_result.scalars().all()
+    total_vehicles = len(all_vehicles)
+    vehicle_ids = [v.id for v in all_vehicles]
+
+    active_count = 0
+    total_test_distance = 0.0
+    if vehicle_ids:
+        data_result = await db.execute(
+            select(VehicleRealtimeData).where(
+                and_(
+                    VehicleRealtimeData.vehicle_id.in_(vehicle_ids),
+                    VehicleRealtimeData.timestamp >= day_start,
+                    VehicleRealtimeData.timestamp < day_end,
+                )
+            )
+        )
+        realtime_data = data_result.scalars().all()
+        active_count = len(set(d.vehicle_id for d in realtime_data))
+
+        prev_points = {}
+        for data in realtime_data:
+            prev = prev_points.get(data.vehicle_id)
+            if prev and prev.latitude and prev.longitude and data.latitude and data.longitude:
+                from math import radians, sin, cos, sqrt, atan2
+                EARTH_RADIUS_KM = 6371.0
+                lat1, lon1 = radians(prev.latitude), radians(prev.longitude)
+                lat2, lon2 = radians(data.latitude), radians(data.longitude)
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+                c = 2 * atan2(sqrt(a), sqrt(1 - a))
+                total_test_distance += EARTH_RADIUS_KM * c
+            prev_points[data.vehicle_id] = data
+
+    alarms_query = select(Alarm).where(
+        and_(
+            Alarm.created_at >= day_start,
+            Alarm.created_at < day_end,
+        )
+    )
+    if company_id:
+        alarms_query = alarms_query.where(Alarm.company_id == company_id)
+    if vehicle_ids:
+        alarms_query = alarms_query.where(Alarm.vehicle_id.in_(vehicle_ids))
+    else:
+        alarms_query = alarms_query.join(TestVehicle).where(
+            and_(TestVehicle.test_area == region,
+                 TestVehicle.company_id == company_id if company_id else True)
+        )
+    alarms_result = await db.execute(alarms_query)
+    alarms = alarms_result.scalars().all()
+    total_alarms = len(alarms)
+    critical_alarms = len([a for a in alarms if a.alarm_level == "critical"])
+
+    accidents_query = select(AccidentReport).where(
+        and_(
+            AccidentReport.accident_time >= day_start,
+            AccidentReport.accident_time < day_end,
+        )
+    )
+    if company_id:
+        accidents_query = accidents_query.where(AccidentReport.company_id == company_id)
+    if vehicle_ids:
+        accidents_query = accidents_query.where(AccidentReport.vehicle_id.in_(vehicle_ids))
+    else:
+        accidents_query = accidents_query.join(TestVehicle).where(
+            and_(TestVehicle.test_area == region,
+                 TestVehicle.company_id == company_id if company_id else True)
+        )
+    accidents_result = await db.execute(accidents_query)
+    new_accidents = len(accidents_result.scalars().all())
+
+    accident_rate = (new_accidents / max(total_test_distance, 1) * 1000.0) if total_test_distance > 0 else 0.0
+
+    devices_query = select(RoadsideDevice).join(
+        TestRoute, RoadsideDevice.route_id == TestRoute.id
+    )
+    if company_id:
+        devices_query = devices_query.where(TestRoute.company_id == company_id)
+    devices_query = devices_query.where(TestRoute.test_area == region)
+    devices_result = await db.execute(devices_query)
+    all_devices = devices_result.scalars().all()
+    total_devices = len(all_devices)
+    online_devices = len([d for d in all_devices if d.status == "online"])
+    device_online_rate = (online_devices / total_devices * 100) if total_devices > 0 else 0.0
+
+    day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    dow = target_date.weekday()
+
+    return DailyRegionMetrics(
+        report_date=target_date,
+        region=region,
+        total_vehicles=total_vehicles,
+        active_vehicles=active_count,
+        total_test_distance=round(total_test_distance, 2),
+        total_alarms=total_alarms,
+        critical_alarms=critical_alarms,
+        accident_rate=round(accident_rate, 4),
+        total_devices=total_devices,
+        online_devices=online_devices,
+        device_online_rate=round(device_online_rate, 2),
+        new_accidents=new_accidents,
+        day_of_week=day_names[dow],
+        is_weekend=dow >= 5
+    )
+
+
+def calculate_trend_analysis(
+    metric_name: str,
+    region: str,
+    daily_data: List[DailyRegionMetrics]
+) -> TrendAnalysis:
+    from app.schemas.report import TrendAnalysis
+
+    metric_map = {
+        "active_vehicles": lambda x: x.active_vehicles,
+        "total_test_distance": lambda x: x.total_test_distance,
+        "total_alarms": lambda x: x.total_alarms,
+        "accident_rate": lambda x: x.accident_rate,
+        "device_online_rate": lambda x: x.device_online_rate,
+    }
+
+    getter = metric_map.get(metric_name)
+    if not getter:
+        return TrendAnalysis(
+            metric_name=metric_name,
+            region=region,
+            values=[],
+            trend_direction="unknown"
+        )
+
+    values = []
+    raw_values = []
+    for data in daily_data:
+        val = getter(data)
+        values.append({
+            "date": data.report_date.isoformat(),
+            "value": val,
+            "day_of_week": data.day_of_week
+        })
+        raw_values.append(val)
+
+    if not raw_values:
+        return TrendAnalysis(
+            metric_name=metric_name,
+            region=region,
+            values=values,
+            trend_direction="unknown"
+        )
+
+    max_val = max(raw_values)
+    min_val = min(raw_values)
+    avg_val = sum(raw_values) / len(raw_values)
+
+    max_idx = raw_values.index(max_val)
+    min_idx = raw_values.index(min_val)
+    max_date = daily_data[max_idx].report_date
+    min_date = daily_data[min_idx].report_date
+
+    volatility = 0.0
+    if len(raw_values) > 1 and avg_val > 0:
+        variance = sum((v - avg_val) ** 2 for v in raw_values) / len(raw_values)
+        std_dev = variance ** 0.5
+        volatility = round(std_dev / avg_val * 100, 2)
+
+    trend_direction = "stable"
+    if len(raw_values) >= 3:
+        first_half = sum(raw_values[:len(raw_values)//2]) / (len(raw_values)//2)
+        second_half = sum(raw_values[len(raw_values)//2:]) / len(raw_values[len(raw_values)//2:])
+        if second_half > first_half * 1.1:
+            trend_direction = "rising"
+        elif second_half < first_half * 0.9:
+            trend_direction = "falling"
+
+    return TrendAnalysis(
+        metric_name=metric_name,
+        region=region,
+        values=values,
+        max_value=round(max_val, 4) if isinstance(max_val, float) else max_val,
+        min_value=round(min_val, 4) if isinstance(min_val, float) else min_val,
+        avg_value=round(avg_val, 4) if isinstance(avg_val, float) else avg_val,
+        max_date=max_date,
+        min_date=min_date,
+        volatility=volatility,
+        trend_direction=trend_direction
+    )
+
+
+@router.get("/region-trend", response_model=RegionTrendResponse, summary="连续多天区域趋势视图")
+async def get_region_trend(
+    company_id: Optional[int] = None,
+    start_date: str = Query(..., description="开始日期 YYYY-MM-DD"),
+    end_date: str = Query(..., description="结束日期 YYYY-MM-DD"),
+    regions: Optional[List[str]] = Query(None, description="区域列表，可传多个"),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.schemas.report import RegionTrendResponse
+
+    try:
+        s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
+
+    if s_date > e_date:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+
+    if (e_date - s_date).days > 365:
+        raise HTTPException(status_code=400, detail="查询范围不能超过365天")
+
+    if not regions:
+        raise HTTPException(status_code=400, detail="请至少指定一个区域")
+
+    regions_list = list(regions)
+    daily_metrics: List[DailyRegionMetrics] = []
+
+    current_date = s_date
+    while current_date <= e_date:
+        for region in regions_list:
+            metrics = await calculate_region_metrics_for_date(
+                db, current_date, region, company_id
+            )
+            daily_metrics.append(metrics)
+        current_date += timedelta(days=1)
+
+    trend_analysis = []
+    volatility_summary = {}
+
+    for region in regions_list:
+        region_data = [m for m in daily_metrics if m.region == region]
+        volatility_summary[region] = {}
+
+        for metric_name in ["active_vehicles", "total_test_distance", "total_alarms", "accident_rate", "device_online_rate"]:
+            trend = calculate_trend_analysis(metric_name, region, region_data)
+            trend_analysis.append(trend)
+            volatility_summary[region][metric_name] = {
+                "volatility": trend.volatility,
+                "trend": trend.trend_direction,
+                "max_value": trend.max_value,
+                "max_date": trend.max_date.isoformat() if trend.max_date else None,
+                "min_value": trend.min_value,
+                "min_date": trend.min_date.isoformat() if trend.min_date else None
+            }
+
+    all_metric_volatility = []
+    for t in trend_analysis:
+        if t.volatility is not None:
+            all_metric_volatility.append({
+                "region": t.region,
+                "metric": t.metric_name,
+                "volatility": t.volatility,
+                "max_date": t.max_date.isoformat() if t.max_date else None,
+                "max_value": t.max_value
+            })
+
+    all_metric_volatility.sort(key=lambda x: x["volatility"], reverse=True)
+
+    peak_day = None
+    lowest_day = None
+    if daily_metrics:
+        peak_day_data = max(daily_metrics, key=lambda x: x.total_alarms + x.new_accidents * 10)
+        lowest_day_data = min(daily_metrics, key=lambda x: x.device_online_rate)
+        peak_day = {
+            "date": peak_day_data.report_date.isoformat(),
+            "region": peak_day_data.region,
+            "alarms": peak_day_data.total_alarms,
+            "accidents": peak_day_data.new_accidents,
+            "online_rate": peak_day_data.device_online_rate,
+            "day_of_week": peak_day_data.day_of_week
+        }
+        lowest_day = {
+            "date": lowest_day_data.report_date.isoformat(),
+            "region": lowest_day_data.region,
+            "online_rate": lowest_day_data.device_online_rate,
+            "day_of_week": lowest_day_data.day_of_week
+        }
+
+    return RegionTrendResponse(
+        start_date=s_date,
+        end_date=e_date,
+        regions=regions_list,
+        total_days=(e_date - s_date).days + 1,
+        daily_metrics=daily_metrics,
+        trend_analysis=trend_analysis,
+        volatility_summary=volatility_summary,
+        peak_day=peak_day,
+        lowest_day=lowest_day
     )
 
 

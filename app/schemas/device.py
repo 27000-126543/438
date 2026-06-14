@@ -209,6 +209,25 @@ class EscalationRule(BaseModel):
         from_attributes = True
 
 
+class CandidateRanking(BaseModel):
+    staff_id: int
+    staff_name: str
+    rank: int
+    total_score: float
+    skill_score: float
+    distance_score: float
+    workload_score: float
+    skill_match_ratio: float
+    distance_km: Optional[float] = None
+    current_workload: int
+    eligible: bool
+    elimination_reason: Optional[str] = None
+    elimination_details: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True
+
+
 class MaintenanceAssignment(BaseModel):
     work_order_id: int
     order_number: str
@@ -224,6 +243,9 @@ class MaintenanceAssignment(BaseModel):
     reason: Optional[str] = None
     message: Optional[str] = None
     pending_reason_detail: Optional[Dict[str, Any]] = None
+    candidate_rankings: Optional[List[CandidateRanking]] = None
+    total_candidates: Optional[int] = None
+    eligible_count: Optional[int] = None
 
     class Config:
         from_attributes = True

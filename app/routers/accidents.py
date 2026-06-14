@@ -38,6 +38,24 @@ STEP_NAMES_CN = {
     "notify_rescue": "通知救援"
 }
 
+STEP_ORDER = {
+    "create_accident": 0,
+    "generate_analysis": 1,
+    "determine_liability": 2,
+    "trigger_insurance": 3,
+    "notify_police": 4,
+    "notify_rescue": 5
+}
+
+SUBSEQUENT_STEPS = {
+    "create_accident": ["generate_analysis", "determine_liability", "trigger_insurance", "notify_police", "notify_rescue"],
+    "generate_analysis": ["determine_liability", "trigger_insurance", "notify_police", "notify_rescue"],
+    "determine_liability": ["trigger_insurance", "notify_police", "notify_rescue"],
+    "trigger_insurance": ["notify_police", "notify_rescue"],
+    "notify_police": ["notify_rescue"],
+    "notify_rescue": []
+}
+
 
 def generate_report_number() -> str:
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -240,6 +258,106 @@ async def step_notify_rescue(
         return False, "救援通知失败", None, e, started_at, datetime.utcnow()
 
 
+async def execute_disposal_step(
+    db: AsyncSession,
+    accident: AccidentReport,
+    step_name: str,
+    vehicle: TestVehicle = None,
+    accident_in: AccidentReportCreate = None
+) -> tuple[bool, str, dict, Exception, datetime, datetime, any]:
+    step_functions = {
+        "generate_analysis": lambda: step_generate_analysis(db, accident, vehicle, accident_in),
+        "determine_liability": lambda: step_determine_liability(db, accident),
+        "trigger_insurance": lambda: step_trigger_insurance(db, accident),
+        "notify_police": lambda: step_notify_police(db, accident),
+        "notify_rescue": lambda: step_notify_rescue(db, accident),
+    }
+
+    step_func = step_functions.get(step_name)
+    if not step_func:
+        return False, f"未知步骤: {step_name}", None, ValueError(f"未知步骤: {step_name}"), datetime.utcnow(), datetime.utcnow(), None
+
+    started_at = datetime.utcnow()
+    if accident_in and accident_in.simulate_failure_step and accident_in.simulate_failure_step == step_name:
+        error_msg = f"模拟{STEP_NAMES_CN.get(step_name, step_name)}步骤失败（测试用）"
+        await save_disposal_step(
+            db, accident.id, step_name,
+            "failed",
+            message=error_msg, error=error_msg,
+            result_data=None,
+            started_at=started_at, completed_at=datetime.utcnow()
+        )
+        return False, error_msg, None, Exception(error_msg), started_at, datetime.utcnow()
+
+    success, message, result_data, error, _, completed_at = await step_func()
+
+    await save_disposal_step(
+        db, accident.id, step_name,
+        "success" if success else "failed",
+        message=message, error=str(error) if error else None,
+        result_data=result_data,
+        started_at=started_at, completed_at=completed_at
+    )
+
+    return success, message, result_data, error, started_at, completed_at
+
+
+async def run_disposal_from_step(
+    db: AsyncSession,
+    accident: AccidentReport,
+    start_step: str,
+    vehicle: TestVehicle = None,
+    accident_in: AccidentReportCreate = None
+) -> List[StepStatus]:
+    steps: List[StepStatus] = []
+    step_names = SUBSEQUENT_STEPS.get(start_step, [])
+    if start_step != "create_accident":
+        step_names = [start_step] + SUBSEQUENT_STEPS.get(start_step, [])
+
+    current_step = start_step
+    blocked = False
+
+    for step_name in step_names:
+        if blocked:
+            steps.append(StepStatus(
+                step=step_name,
+                success=False,
+                message=f"已跳过，因前序步骤 {STEP_NAMES_CN.get(current_step, current_step)} 失败",
+                executed_at=datetime.utcnow(),
+                error="blocked_by_previous_failure"
+            ))
+            continue
+
+        success, message, result_data, error, started_at, completed_at = await execute_disposal_step(
+            db, accident, step_name, vehicle, accident_in
+        )
+
+        step_status = StepStatus(
+            step=step_name,
+            success=success,
+            message=message,
+            executed_at=completed_at,
+            error=str(error) if error else None,
+            result_data=result_data
+        )
+        steps.append(step_status)
+
+        if not success:
+            blocked = True
+            current_step = step_name
+            accident.blocked_at_step = step_name
+            await db.commit()
+            await db.refresh(accident)
+            break
+
+    if not blocked:
+        accident.blocked_at_step = None
+        await db.commit()
+        await db.refresh(accident)
+
+    return steps
+
+
 @router.post("", response_model=AccidentOneClickResponse, status_code=201)
 async def create_accident(
     accident_in: AccidentReportCreate,
@@ -269,7 +387,8 @@ async def create_accident(
             accident_id=0,
             report_number="",
             steps=steps,
-            all_succeeded=False
+            all_succeeded=False,
+            blocked_at_step="create_accident"
         )
 
     report_number = generate_report_number()
@@ -315,97 +434,30 @@ async def create_accident(
         executed_at=create_completed
     ))
 
-    success, message, result_data, error, started_at, completed_at = await step_generate_analysis(db, accident, vehicle, accident_in)
-    await save_disposal_step(
-        db, accident.id, "generate_analysis",
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
+    disposal_steps = await run_disposal_from_step(
+        db, accident, "generate_analysis", vehicle, accident_in
     )
-    if success:
-        analysis_summary = result_data
-    steps.append(StepStatus(
-        step="generate_analysis",
-        success=success,
-        message=message,
-        executed_at=completed_at,
-        error=str(error) if error else None
-    ))
+    steps.extend(disposal_steps)
 
-    success, message, result_data, error, started_at, completed_at = await step_determine_liability(db, accident)
-    await save_disposal_step(
-        db, accident.id, "determine_liability",
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
-    )
-    if success:
-        liability_result = result_data
-    steps.append(StepStatus(
-        step="determine_liability",
-        success=success,
-        message=message,
-        executed_at=completed_at,
-        error=str(error) if error else None
-    ))
-
-    success, message, result_data, error, started_at, completed_at = await step_trigger_insurance(db, accident)
-    await save_disposal_step(
-        db, accident.id, "trigger_insurance",
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
-    )
-    if success:
-        insurance_claim_number = result_data.get("claim_number")
-    steps.append(StepStatus(
-        step="trigger_insurance",
-        success=success,
-        message=message,
-        executed_at=completed_at,
-        error=str(error) if error else None
-    ))
-
-    success, message, result_data, error, started_at, completed_at = await step_notify_police(db, accident)
-    await save_disposal_step(
-        db, accident.id, "notify_police",
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
-    )
-    if success and result_data:
-        police_notified_at = result_data.get("notified_at")
-    steps.append(StepStatus(
-        step="notify_police",
-        success=success,
-        message=message,
-        executed_at=completed_at,
-        error=str(error) if error else None
-    ))
-
-    success, message, result_data, error, started_at, completed_at = await step_notify_rescue(db, accident)
-    await save_disposal_step(
-        db, accident.id, "notify_rescue",
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
-    )
-    if success and result_data:
-        rescue_notified_at = result_data.get("notified_at")
-    steps.append(StepStatus(
-        step="notify_rescue",
-        success=success,
-        message=message,
-        executed_at=completed_at,
-        error=str(error) if error else None
-    ))
+    for s in disposal_steps:
+        if s.success:
+            if s.step == "generate_analysis" and s.error is None:
+                analysis_summary = s.result_data
+            elif s.step == "determine_liability":
+                liability_result = s.result_data
+            elif s.step == "trigger_insurance":
+                if s.result_data and "claim_number" in s.result_data:
+                    insurance_claim_number = s.result_data["claim_number"]
+                else:
+                    insurance_claim_number = s.message
+            elif s.step == "notify_police":
+                police_notified_at = s.executed_at
+            elif s.step == "notify_rescue":
+                rescue_notified_at = s.executed_at
 
     all_succeeded = all(s.success for s in steps)
+
+    await db.refresh(accident)
 
     return AccidentOneClickResponse(
         accident_id=accident.id,
@@ -416,7 +468,8 @@ async def create_accident(
         police_notified_at=police_notified_at,
         rescue_notified_at=rescue_notified_at,
         steps=steps,
-        all_succeeded=all_succeeded
+        all_succeeded=all_succeeded,
+        blocked_at_step=accident.blocked_at_step
     )
 
 
@@ -903,6 +956,7 @@ async def get_accident_disposal_detail(
         overall_status=overall_status,
         all_succeeded=all_succeeded,
         failed_step=failed_step,
+        blocked_at_step=accident.blocked_at_step,
         total_attempts=total_attempts,
         timeline=step_histories
     )
@@ -914,6 +968,8 @@ async def retry_disposal_step(
     step_name: str,
     db: AsyncSession = Depends(get_db)
 ):
+    from app.schemas.accident import SubsequentStepExecution
+
     if step_name not in VALID_STEPS:
         raise HTTPException(
             status_code=400,
@@ -940,27 +996,31 @@ async def retry_disposal_step(
     if not vehicle:
         raise HTTPException(status_code=404, detail="关联车辆不存在")
 
-    step_functions = {
-        "generate_analysis": lambda: step_generate_analysis(db, accident, vehicle),
-        "determine_liability": lambda: step_determine_liability(db, accident),
-        "trigger_insurance": lambda: step_trigger_insurance(db, accident),
-        "notify_police": lambda: step_notify_police(db, accident),
-        "notify_rescue": lambda: step_notify_rescue(db, accident),
-    }
-
-    step_func = step_functions.get(step_name)
-    if not step_func:
-        raise HTTPException(status_code=400, detail=f"步骤 {step_name} 暂不支持重试")
-
-    success, message, result_data, error, started_at, completed_at = await step_func()
-
-    await save_disposal_step(
-        db, accident.id, step_name,
-        "success" if success else "failed",
-        message=message, error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at, completed_at=completed_at
+    step_executions = await run_disposal_from_step(
+        db, accident, step_name, vehicle
     )
+
+    retry_step_result = None
+    for s in step_executions:
+        if s.step == step_name:
+            retry_step_result = s
+            break
+
+    if not retry_step_result:
+        raise HTTPException(status_code=500, detail="重试失败，未找到步骤结果")
+
+    subsequent_executions = []
+    for s in step_executions:
+        if s.step != step_name:
+            subsequent_executions.append(SubsequentStepExecution(
+                step_name=s.step,
+                success=s.success,
+                status="success" if s.success else "failed",
+                message=s.message,
+                error=s.error,
+                started_at=s.executed_at,
+                completed_at=s.executed_at
+            ))
 
     attempt_result = await db.execute(
         select(AccidentDisposalStep.attempt_number).where(
@@ -972,15 +1032,20 @@ async def retry_disposal_step(
     )
     attempt_number = attempt_result.scalar() or 1
 
+    all_succeeded = retry_step_result.success and all(s.success for s in subsequent_executions)
+
     return StepRetryResponse(
         accident_id=accident.id,
         step_name=step_name,
         attempt_number=attempt_number,
-        status="success" if success else "failed",
-        success=success,
-        message=message,
-        error=str(error) if error else None,
-        result_data=result_data,
-        started_at=started_at,
-        completed_at=completed_at
+        status="success" if retry_step_result.success else "failed",
+        success=retry_step_result.success,
+        message=retry_step_result.message,
+        error=retry_step_result.error,
+        result_data=None,
+        started_at=retry_step_result.executed_at,
+        completed_at=retry_step_result.executed_at,
+        subsequent_executed=subsequent_executions,
+        new_blocked_at_step=accident.blocked_at_step,
+        all_succeeded=all_succeeded
     )

@@ -62,7 +62,7 @@ class AccidentReportBase(BaseModel):
 
 
 class AccidentReportCreate(AccidentReportBase):
-    pass
+    simulate_failure_step: Optional[str] = None
 
 
 class AccidentReportUpdate(BaseModel):
@@ -176,6 +176,7 @@ class StepStatus(BaseModel):
     message: str
     executed_at: Optional[datetime] = None
     error: Optional[str] = None
+    result_data: Optional[Dict[str, Any]] = None
 
 
 class AccidentOneClickResponse(BaseModel):
@@ -188,6 +189,7 @@ class AccidentOneClickResponse(BaseModel):
     rescue_notified_at: Optional[datetime] = None
     steps: List[StepStatus]
     all_succeeded: bool
+    blocked_at_step: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -209,12 +211,23 @@ class DisposalStepHistory(BaseModel):
         from_attributes = True
 
 
+class SubsequentStepExecution(BaseModel):
+    step_name: str
+    success: bool
+    status: str
+    message: str
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
 class AccidentDisposalDetailResponse(BaseModel):
     accident_id: int
     report_number: str
     overall_status: str
     all_succeeded: bool
     failed_step: Optional[str] = None
+    blocked_at_step: Optional[str] = None
     total_attempts: int
     timeline: List[DisposalStepHistory]
 
@@ -233,3 +246,6 @@ class StepRetryResponse(BaseModel):
     result_data: Optional[Dict[str, Any]] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    subsequent_executed: List[SubsequentStepExecution] = []
+    new_blocked_at_step: Optional[str] = None
+    all_succeeded: Optional[bool] = None
