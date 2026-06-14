@@ -88,9 +88,10 @@ async def generate_daily_report(
         )
         existing_report = existing_result.scalar_one_or_none()
 
-        vehicles_result = await db.execute(
-            select(TestVehicle).where(TestVehicle.company_id == company.id)
-        )
+        vehicles_query = select(TestVehicle).where(TestVehicle.company_id == company.id)
+        if region:
+            vehicles_query = vehicles_query.where(TestVehicle.test_area == region)
+        vehicles_result = await db.execute(vehicles_query)
         all_vehicles = vehicles_result.scalars().all()
         total_vehicles = len(all_vehicles)
         vehicle_ids = [v.id for v in all_vehicles]
@@ -155,15 +156,18 @@ async def generate_daily_report(
 
         average_speed = sum(speeds) / len(speeds) if speeds else 0.0
 
-        alarms_result = await db.execute(
-            select(Alarm).where(
-                and_(
-                    Alarm.company_id == company.id,
-                    Alarm.created_at >= day_start,
-                    Alarm.created_at < day_end,
-                )
+        alarms_query = select(Alarm).where(
+            and_(
+                Alarm.company_id == company.id,
+                Alarm.created_at >= day_start,
+                Alarm.created_at < day_end,
             )
         )
+        if region and vehicle_ids:
+            alarms_query = alarms_query.where(Alarm.vehicle_id.in_(vehicle_ids))
+        elif region:
+            alarms_query = alarms_query.join(TestVehicle).where(TestVehicle.test_area == region)
+        alarms_result = await db.execute(alarms_query)
         alarms = alarms_result.scalars().all()
         total_alarms = len(alarms)
         critical_alarms = len([a for a in alarms if a.alarm_level == "critical"])
@@ -171,26 +175,32 @@ async def generate_daily_report(
         info_alarms = len([a for a in alarms if a.alarm_level == "info"])
         alarms_resolved = len([a for a in alarms if a.status == "resolved"])
 
-        accidents_result = await db.execute(
-            select(AccidentReport).where(
-                and_(
-                    AccidentReport.company_id == company.id,
-                    AccidentReport.accident_time >= day_start,
-                    AccidentReport.accident_time < day_end,
-                )
+        accidents_query = select(AccidentReport).where(
+            and_(
+                AccidentReport.company_id == company.id,
+                AccidentReport.accident_time >= day_start,
+                AccidentReport.accident_time < day_end,
             )
         )
+        if region and vehicle_ids:
+            accidents_query = accidents_query.where(AccidentReport.vehicle_id.in_(vehicle_ids))
+        elif region:
+            accidents_query = accidents_query.join(TestVehicle).where(TestVehicle.test_area == region)
+        accidents_result = await db.execute(accidents_query)
         accidents = accidents_result.scalars().all()
         new_accidents = len(accidents)
 
-        ongoing_accidents_result = await db.execute(
-            select(AccidentReport).where(
-                and_(
-                    AccidentReport.company_id == company.id,
-                    AccidentReport.status.in_(["under_investigation", "pending"]),
-                )
+        ongoing_accidents_query = select(AccidentReport).where(
+            and_(
+                AccidentReport.company_id == company.id,
+                AccidentReport.status.in_(["under_investigation", "pending"]),
             )
         )
+        if region and vehicle_ids:
+            ongoing_accidents_query = ongoing_accidents_query.where(AccidentReport.vehicle_id.in_(vehicle_ids))
+        elif region:
+            ongoing_accidents_query = ongoing_accidents_query.join(TestVehicle).where(TestVehicle.test_area == region)
+        ongoing_accidents_result = await db.execute(ongoing_accidents_query)
         ongoing_accidents = len(ongoing_accidents_result.scalars().all())
 
         if total_test_distance > 0:
@@ -207,15 +217,20 @@ async def generate_daily_report(
         online_devices = len([d for d in all_devices if d.status == "online"])
         device_online_rate = (online_devices / total_devices * 100) if total_devices > 0 else 0.0
 
-        maintenance_result = await db.execute(
-            select(MaintenanceWorkOrder).where(
-                and_(
-                    MaintenanceWorkOrder.company_id == company.id,
-                    MaintenanceWorkOrder.created_at >= day_start,
-                    MaintenanceWorkOrder.created_at < day_end,
-                )
+        maintenance_query = select(MaintenanceWorkOrder).where(
+            and_(
+                MaintenanceWorkOrder.company_id == company.id,
+                MaintenanceWorkOrder.created_at >= day_start,
+                MaintenanceWorkOrder.created_at < day_end,
             )
         )
+        if region:
+            maintenance_query = maintenance_query.join(
+                RoadsideDevice, MaintenanceWorkOrder.device_id == RoadsideDevice.id
+            ).join(
+                TestRoute, RoadsideDevice.route_id == TestRoute.id
+            ).where(TestRoute.test_area == region)
+        maintenance_result = await db.execute(maintenance_query)
         maintenance_orders = maintenance_result.scalars().all()
         total_maintenance = len(maintenance_orders)
         completed_maintenance = len([m for m in maintenance_orders if m.status == "completed"])
@@ -516,6 +531,8 @@ async def get_overview_statistics(
     vehicles_query = select(TestVehicle)
     if company_id:
         vehicles_query = vehicles_query.where(TestVehicle.company_id == company_id)
+    if region:
+        vehicles_query = vehicles_query.where(TestVehicle.test_area == region)
     vehicles_result = await db.execute(vehicles_query)
     all_vehicles = vehicles_result.scalars().all()
     total_vehicles = len(all_vehicles)
@@ -550,15 +567,20 @@ async def get_overview_statistics(
     accident_query = select(AccidentReport)
     if company_id:
         accident_query = accident_query.where(AccidentReport.company_id == company_id)
+    if region and vehicle_ids:
+        accident_query = accident_query.where(AccidentReport.vehicle_id.in_(vehicle_ids))
+    elif region:
+        accident_query = accident_query.join(TestVehicle).where(TestVehicle.test_area == region)
     accidents_result = await db.execute(accident_query)
     total_accidents = len(accidents_result.scalars().all())
 
     total_distance = 0.0
-    mileage_result = await db.execute(
-        select(func.sum(TestVehicle.mileage)).where(TestVehicle.company_id == company_id)
-        if company_id
-        else select(func.sum(TestVehicle.mileage))
-    )
+    mileage_query = select(func.sum(TestVehicle.mileage))
+    if company_id:
+        mileage_query = mileage_query.where(TestVehicle.company_id == company_id)
+    if region:
+        mileage_query = mileage_query.where(TestVehicle.test_area == region)
+    mileage_result = await db.execute(mileage_query)
     total_distance = mileage_result.scalar() or 0.0
 
     if total_distance > 0:
@@ -577,6 +599,7 @@ async def get_overview_statistics(
             "device_online_rate": round(device_online_rate, 2),
             "total_accidents": total_accidents,
             "accident_rate_per_1000km": round(accident_rate, 4),
+            "total_test_distance": round(total_distance, 2),
         },
     }
 

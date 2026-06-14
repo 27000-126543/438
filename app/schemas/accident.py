@@ -24,7 +24,7 @@ class AccidentReportBase(BaseModel):
     description: Optional[str] = None
     injuries: Optional[str] = None
     damages: Optional[str] = None
-    vehicle_log_data: Optional[Dict[str, Any]] = None
+    vehicle_log_data: Optional[Any] = None
     roadside_sensor_data: Optional[Dict[str, Any]] = None
     police_report: Optional[str] = None
     insurance_claim_number: Optional[str] = None
@@ -83,7 +83,7 @@ class AccidentReportUpdate(BaseModel):
     description: Optional[str] = None
     injuries: Optional[str] = None
     damages: Optional[str] = None
-    vehicle_log_data: Optional[Dict[str, Any]] = None
+    vehicle_log_data: Optional[Any] = None
     roadside_sensor_data: Optional[Dict[str, Any]] = None
     police_report: Optional[str] = None
     insurance_claim_number: Optional[str] = None
@@ -165,6 +165,29 @@ class NotificationResult(BaseModel):
     notified: bool
     notified_at: Optional[datetime] = None
     message: str
+
+    class Config:
+        from_attributes = True
+
+
+class StepStatus(BaseModel):
+    step: str
+    success: bool
+    message: str
+    executed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
+class AccidentOneClickResponse(BaseModel):
+    accident_id: int
+    report_number: str
+    analysis_summary: Optional[Dict[str, Any]] = None
+    liability_result: Optional[Dict[str, Any]] = None
+    insurance_claim_number: Optional[str] = None
+    police_notified_at: Optional[datetime] = None
+    rescue_notified_at: Optional[datetime] = None
+    steps: List[StepStatus]
+    all_succeeded: bool
 
     class Config:
         from_attributes = True

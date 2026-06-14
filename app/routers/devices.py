@@ -127,7 +127,93 @@ async def device_heartbeat(
     )
 
 
-@router.post("/check-offline", summary="检查离线设备并自动生成维修工单")
+async def auto_assign_work_order(
+    order: MaintenanceWorkOrder,
+    device: RoadsideDevice,
+    db: AsyncSession
+):
+    required_skills = set(order.required_skills or [])
+
+    staff_result = await db.execute(
+        select(MaintenanceStaff).where(
+            MaintenanceStaff.status.in_(["available", "on_duty"])
+        )
+    )
+    available_staff = staff_result.scalars().all()
+
+    if not available_staff:
+        return {
+            "success": False,
+            "reason": "no_available_staff",
+            "message": "没有可用的维护人员，工单保持待分配状态"
+        }
+
+    scored_staff = []
+    for staff in available_staff:
+        score = 0.0
+        staff_skills = set(staff.skills or [])
+
+        if required_skills:
+            matched = len(required_skills & staff_skills)
+            skill_score = matched / len(required_skills) if required_skills else 1.0
+            score += skill_score * 60
+        else:
+            score += 60
+
+        if device and staff.current_latitude and staff.current_longitude and device.latitude and device.longitude:
+            distance = calculate_distance(
+                device.latitude,
+                device.longitude,
+                staff.current_latitude,
+                staff.current_longitude,
+            )
+            distance_score = max(0.0, 1.0 - distance / 50.0)
+            score += distance_score * 30
+        else:
+            score += 15
+
+        workload_score = max(0.0, 1.0 - staff.workload / 10.0)
+        score += workload_score * 10
+
+        scored_staff.append((score, staff))
+
+    if not scored_staff:
+        return {
+            "success": False,
+            "reason": "no_matching_skills",
+            "message": "没有匹配技能要求的维护人员，工单保持待分配状态"
+        }
+
+    scored_staff.sort(key=lambda x: x[0], reverse=True)
+    staff = scored_staff[0][1]
+
+    order.assigned_to = staff.name
+    order.assignee_skills = staff.skills
+    order.assigned_at = datetime.utcnow()
+    order.status = "assigned"
+    staff.workload += 1
+    staff.updated_at = datetime.utcnow()
+    order.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(order)
+    await db.refresh(staff)
+
+    matched_skills = list(required_skills & set(staff.skills or []))
+    missing_skills = list(required_skills - set(staff.skills or [])) if required_skills else None
+
+    return {
+        "success": True,
+        "staff_id": staff.id,
+        "staff_name": staff.name,
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "score": scored_staff[0][0],
+        "message": f"已自动分配给 {staff.name}"
+    }
+
+
+@router.post("/check-offline", summary="检查离线设备并自动生成维修工单和派单")
 async def check_offline_devices(
     db: AsyncSession = Depends(get_db),
 ):
@@ -163,6 +249,7 @@ async def check_offline_devices(
         )
         existing_order = existing_result.scalar_one_or_none()
 
+        order_info = None
         if not existing_order:
             company_id = 1
             if device.route_id:
@@ -190,7 +277,19 @@ async def check_offline_devices(
                 reported_by="system",
             )
             db.add(order)
-            generated_orders.append(order)
+            await db.flush()
+            await db.refresh(order)
+
+            assign_result = await auto_assign_work_order(order, device, db)
+
+            order_info = {
+                "order_number": order.order_number,
+                "device_id": order.device_id,
+                "priority": order.priority,
+                "status": order.status,
+                "assignment": assign_result
+            }
+            generated_orders.append(order_info)
 
         device.updated_at = datetime.utcnow()
 
@@ -200,14 +299,9 @@ async def check_offline_devices(
         "message": f"检查完成，发现 {len(offline_devices)} 台离线设备，生成 {len(generated_orders)} 个维修工单",
         "offline_device_count": len(offline_devices),
         "generated_order_count": len(generated_orders),
-        "generated_orders": [
-            {
-                "order_number": o.order_number,
-                "device_id": o.device_id,
-                "priority": o.priority,
-            }
-            for o in generated_orders
-        ],
+        "assigned_count": len([o for o in generated_orders if o["status"] == "assigned"]),
+        "pending_count": len([o for o in generated_orders if o["status"] == "pending"]),
+        "generated_orders": generated_orders,
     }
 
 

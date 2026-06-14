@@ -142,6 +142,7 @@ class TestRoute(Base):
     route_name = Column(String(100), nullable=False, index=True)
     route_code = Column(String(50), unique=True, nullable=False, index=True)
     route_type = Column(String(50))
+    test_area = Column(String(100))
     start_point = Column(String(200))
     end_point = Column(String(200))
     waypoints = Column(JSON)
@@ -179,6 +180,7 @@ class TestRoute(Base):
             "route_name": self.route_name,
             "route_code": self.route_code,
             "route_type": self.route_type,
+            "test_area": self.test_area,
             "start_point": self.start_point,
             "end_point": self.end_point,
             "waypoints": self.waypoints,

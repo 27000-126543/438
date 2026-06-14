@@ -265,6 +265,7 @@ async def apply_for_route(
         route_name=route_data.route_name,
         route_code=route_data.route_code or generate_route_code(),
         route_type=route_data.route_type,
+        test_area=route_data.test_area,
         start_point=route_data.start_point,
         end_point=route_data.end_point,
         waypoints=route_data.waypoints,

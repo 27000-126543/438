@@ -7,6 +7,7 @@ class TestRouteBase(BaseModel):
     route_name: str
     route_code: str
     route_type: Optional[str] = None
+    test_area: Optional[str] = None
     start_point: Optional[str] = None
     end_point: Optional[str] = None
     waypoints: Optional[List[Dict[str, Any]]] = None
