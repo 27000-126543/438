@@ -48,7 +48,7 @@ class DeviceUpdate(BaseModel):
 
 
 class WorkOrderAssign(BaseModel):
-    staff_id: int
+    staff_id: Optional[int] = None
 
 
 def generate_order_number() -> str:
@@ -192,6 +192,7 @@ async def auto_assign_work_order(
     db: AsyncSession
 ):
     from app.schemas.device import CandidateRanking
+    from sqlalchemy import func as sa_func
 
     required_skills = set(order.required_skills or [])
     priority = order.priority or "normal"
@@ -223,6 +224,21 @@ async def auto_assign_work_order(
             "total_candidates": 0,
             "eligible_count": 0
         }
+
+    staff_workloads = {}
+    for staff in all_staff:
+        wl_result = await db.execute(
+            select(sa_func.count(MaintenanceWorkOrder.id)).where(
+                and_(
+                    MaintenanceWorkOrder.assignee_id == staff.id,
+                    MaintenanceWorkOrder.status.in_(["pending", "assigned", "in_progress"])
+                )
+            )
+        )
+        actual_wl = wl_result.scalar() or 0
+        staff_workloads[staff.id] = actual_wl
+        if staff.workload != actual_wl:
+            staff.workload = actual_wl
 
     no_skill_count = 0
     too_far_count = 0
@@ -267,12 +283,14 @@ async def auto_assign_work_order(
                     "max_allowed": MAX_DISTANCE_KM
                 }
 
-        if staff.workload >= MAX_WORKLOAD:
+        actual_workload = staff_workloads.get(staff.id, 0)
+
+        if actual_workload >= MAX_WORKLOAD:
             overloaded_count += 1
             is_eligible = False
             elimination_reasons.append("工单满载")
             elimination_details["overloaded"] = {
-                "current_workload": staff.workload,
+                "current_workload": actual_workload,
                 "max_allowed": MAX_WORKLOAD
             }
 
@@ -293,7 +311,7 @@ async def auto_assign_work_order(
             distance_score = 15
         score += distance_score
 
-        workload_score = max(0.0, 1.0 - staff.workload / MAX_WORKLOAD) * 10
+        workload_score = max(0.0, 1.0 - actual_workload / MAX_WORKLOAD) * 10
         score += workload_score
 
         all_scored.append({
@@ -304,7 +322,7 @@ async def auto_assign_work_order(
             "workload_score": workload_score,
             "skill_match_ratio": skill_match_ratio,
             "distance_km": distance,
-            "current_workload": staff.workload,
+            "current_workload": actual_workload,
             "eligible": is_eligible,
             "elimination_reason": "、".join(elimination_reasons) if elimination_reasons else None,
             "elimination_details": elimination_details if elimination_details else None
@@ -638,76 +656,111 @@ async def assign_maintenance_staff(
         staff = staff_result.scalar_one_or_none()
         if not staff:
             raise HTTPException(status_code=404, detail="维护人员不存在")
-    else:
-        required_skills = set(order.required_skills or [])
 
-        staff_result = await db.execute(
-            select(MaintenanceStaff).where(
-                MaintenanceStaff.status.in_(["available", "on_duty"])
+        distance = None
+        if device and staff.current_latitude and staff.current_longitude:
+            distance = calculate_distance(
+                device.latitude, device.longitude,
+                staff.current_latitude, staff.current_longitude,
             )
+
+        travel_time_hours = (distance or 5.0) / AVERAGE_TRAVEL_SPEED_KMH
+        estimated_arrival = datetime.utcnow() + timedelta(hours=travel_time_hours)
+        estimated_completion = estimated_arrival + timedelta(minutes=ESTIMATED_REPAIR_MINUTES)
+
+        order.assigned_to = staff.name
+        order.assignee_id = staff.id
+        order.assignee_skills = staff.skills
+        order.assigned_at = datetime.utcnow()
+        order.status = "assigned"
+        order.estimated_arrival = estimated_arrival
+        order.estimated_completion = estimated_completion
+        staff.workload += 1
+        staff.updated_at = datetime.utcnow()
+        order.updated_at = datetime.utcnow()
+
+        await db.commit()
+        await db.refresh(order)
+        await db.refresh(staff)
+
+        required_skills = set(order.required_skills or [])
+        staff_skills = set(staff.skills or [])
+        matched_skills = list(required_skills & staff_skills)
+        missing_skills = list(required_skills - staff_skills) if required_skills else None
+
+        assignment_basis = {
+            "skill_score": 60.0,
+            "skill_weight": 60,
+            "distance_score": round(max(0.0, 1.0 - (distance or 0) / MAX_DISTANCE_KM) * 30, 2) if distance else 15.0,
+            "distance_weight": 30,
+            "workload_score": round(max(0.0, 1.0 - staff.workload / MAX_WORKLOAD) * 10, 2),
+            "workload_weight": 10,
+            "total_score": 0,
+            "skill_match_ratio": round(len(required_skills & staff_skills) / len(required_skills), 2) if required_skills else 1.0,
+            "distance_km": round(distance, 2) if distance else None,
+            "current_workload": staff.workload - 1,
+            "manually_assigned": True
+        }
+        assignment_basis["total_score"] = round(
+            assignment_basis["skill_score"] + assignment_basis["distance_score"] + assignment_basis["workload_score"], 2
         )
-        available_staff = staff_result.scalars().all()
 
-        if not available_staff:
-            raise HTTPException(status_code=404, detail="没有可用的维护人员")
+        return MaintenanceAssignment(
+            work_order_id=order.id,
+            order_number=order.order_number,
+            assigned_staff_id=staff.id,
+            assigned_staff_name=staff.name,
+            matched_skills=matched_skills,
+            missing_skills=missing_skills,
+            estimated_arrival_time=estimated_arrival,
+            estimated_completion_time=estimated_completion,
+            assignment_basis=assignment_basis,
+            escalation_rules=generate_escalation_rules(order.priority or "normal"),
+            success=True,
+            message=f"已手动分配给 {staff.name}，预计 {travel_time_hours*60:.0f} 分钟后到场",
+            candidate_rankings=[],
+            total_candidates=1,
+            eligible_count=1
+        )
+    else:
+        assign_result = await auto_assign_work_order(order, device, db)
 
-        scored_staff = []
-        for staff in available_staff:
-            score = 0.0
-            staff_skills = set(staff.skills or [])
-
-            if required_skills:
-                matched = len(required_skills & staff_skills)
-                skill_score = matched / len(required_skills) if required_skills else 1.0
-                score += skill_score * 60
-            else:
-                score += 60
-
-            if device and staff.current_latitude and staff.current_longitude:
-                distance = calculate_distance(
-                    device.latitude,
-                    device.longitude,
-                    staff.current_latitude,
-                    staff.current_longitude,
-                )
-                distance_score = max(0.0, 1.0 - distance / 50.0)
-                score += distance_score * 30
-            else:
-                score += 15
-
-            workload_score = max(0.0, 1.0 - staff.workload / 10.0)
-            score += workload_score * 10
-
-            scored_staff.append((score, staff))
-
-        scored_staff.sort(key=lambda x: x[0], reverse=True)
-        staff = scored_staff[0][1]
-
-    order.assigned_to = staff.name
-    order.assignee_skills = staff.skills
-    order.assigned_at = datetime.utcnow()
-    order.status = "assigned"
-    staff.workload += 1
-    staff.updated_at = datetime.utcnow()
-    order.updated_at = datetime.utcnow()
-
-    await db.commit()
-    await db.refresh(order)
-    await db.refresh(staff)
-
-    required_skills = set(order.required_skills or [])
-    staff_skills = set(staff.skills or [])
-    matched_skills = list(required_skills & staff_skills)
-    missing_skills = list(required_skills - staff_skills) if required_skills else None
-
-    return MaintenanceAssignment(
-        work_order_id=order.id,
-        order_number=order.order_number,
-        assigned_staff_id=staff.id,
-        assigned_staff_name=staff.name,
-        matched_skills=matched_skills,
-        missing_skills=missing_skills,
-    )
+        if assign_result.get("success"):
+            return MaintenanceAssignment(
+                work_order_id=order.id,
+                order_number=order.order_number,
+                assigned_staff_id=assign_result.get("staff_id"),
+                assigned_staff_name=assign_result.get("staff_name"),
+                matched_skills=assign_result.get("matched_skills"),
+                missing_skills=assign_result.get("missing_skills"),
+                estimated_arrival_time=datetime.fromisoformat(assign_result["estimated_arrival_time"]) if assign_result.get("estimated_arrival_time") else None,
+                estimated_completion_time=datetime.fromisoformat(assign_result["estimated_completion_time"]) if assign_result.get("estimated_completion_time") else None,
+                assignment_basis=assign_result.get("assignment_basis"),
+                escalation_rules=assign_result.get("escalation_rules"),
+                success=True,
+                reason=None,
+                message=assign_result.get("message"),
+                pending_reason_detail=None,
+                candidate_rankings=assign_result.get("candidate_rankings"),
+                total_candidates=assign_result.get("total_candidates"),
+                eligible_count=assign_result.get("eligible_count")
+            )
+        else:
+            return MaintenanceAssignment(
+                work_order_id=order.id,
+                order_number=order.order_number,
+                assigned_staff_id=None,
+                assigned_staff_name=None,
+                matched_skills=None,
+                missing_skills=None,
+                success=False,
+                reason=assign_result.get("reason"),
+                message=assign_result.get("message"),
+                pending_reason_detail=assign_result.get("pending_reason_detail"),
+                candidate_rankings=assign_result.get("candidate_rankings"),
+                total_candidates=assign_result.get("total_candidates"),
+                eligible_count=assign_result.get("eligible_count", 0)
+            )
 
 
 @router.get("/work-orders/{order_id}", summary="获取维修工单详情", response_model=MaintenanceWorkOrderResponse)
@@ -734,6 +787,8 @@ async def list_maintenance_staff(
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
+    from sqlalchemy import func as sa_func
+
     query = select(MaintenanceStaff)
 
     conditions = []
@@ -749,9 +804,32 @@ async def list_maintenance_staff(
     result = await db.execute(query)
     staff_list = result.scalars().all()
 
+    staff_dicts = []
+    for staff in staff_list:
+        wl_result = await db.execute(
+            select(sa_func.count(MaintenanceWorkOrder.id)).where(
+                and_(
+                    MaintenanceWorkOrder.assignee_id == staff.id,
+                    MaintenanceWorkOrder.status.in_(["pending", "assigned", "in_progress"])
+                )
+            )
+        )
+        actual_workload = wl_result.scalar() or 0
+
+        if staff.workload != actual_workload:
+            staff.workload = actual_workload
+            staff.updated_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(staff)
+
+        staff_dict = staff.to_dict()
+        staff_dict["current_workload"] = actual_workload
+        staff_dict["available"] = staff.status in ["available", "on_duty"] and actual_workload < MAX_WORKLOAD
+        staff_dicts.append(staff_dict)
+
     return {
         "total": len(staff_list),
-        "staff": [s.to_dict() for s in staff_list],
+        "staff": staff_dicts,
     }
 
 

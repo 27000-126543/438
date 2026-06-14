@@ -219,6 +219,7 @@ class SubsequentStepExecution(BaseModel):
     error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    result_data: Optional[Dict[str, Any]] = None
 
 
 class AccidentDisposalDetailResponse(BaseModel):

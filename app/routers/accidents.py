@@ -905,9 +905,15 @@ async def get_accident_disposal_detail(
     result = await db.execute(
         select(AccidentDisposalStep)
         .where(AccidentDisposalStep.accident_id == accident_id)
-        .order_by(AccidentDisposalStep.step_name, AccidentDisposalStep.attempt_number)
+        .order_by(AccidentDisposalStep.started_at, AccidentDisposalStep.attempt_number)
     )
     all_steps = result.scalars().all()
+
+    all_steps = sorted(all_steps, key=lambda s: (
+        s.started_at or datetime.min,
+        STEP_ORDER.get(s.step_name, 99),
+        s.attempt_number
+    ))
 
     latest_status = {}
     for step in all_steps:
@@ -996,6 +1002,16 @@ async def retry_disposal_step(
     if not vehicle:
         raise HTTPException(status_code=404, detail="关联车辆不存在")
 
+    before_steps_result = await db.execute(
+        select(AccidentDisposalStep.attempt_number).where(
+            and_(
+                AccidentDisposalStep.accident_id == accident_id,
+                AccidentDisposalStep.step_name == step_name
+            )
+        ).order_by(desc(AccidentDisposalStep.attempt_number))
+    )
+    attempt_before = before_steps_result.scalar() or 0
+
     step_executions = await run_disposal_from_step(
         db, accident, step_name, vehicle
     )
@@ -1009,28 +1025,80 @@ async def retry_disposal_step(
     if not retry_step_result:
         raise HTTPException(status_code=500, detail="重试失败，未找到步骤结果")
 
-    subsequent_executions = []
-    for s in step_executions:
-        if s.step != step_name:
-            subsequent_executions.append(SubsequentStepExecution(
-                step_name=s.step,
-                success=s.success,
-                status="success" if s.success else "failed",
-                message=s.message,
-                error=s.error,
-                started_at=s.executed_at,
-                completed_at=s.executed_at
-            ))
-
-    attempt_result = await db.execute(
-        select(AccidentDisposalStep.attempt_number).where(
+    after_steps_result = await db.execute(
+        select(AccidentDisposalStep).where(
             and_(
                 AccidentDisposalStep.accident_id == accident_id,
-                AccidentDisposalStep.step_name == step_name
+                AccidentDisposalStep.attempt_number > attempt_before
             )
-        ).order_by(desc(AccidentDisposalStep.attempt_number))
+        ).order_by(
+            AccidentDisposalStep.started_at,
+            AccidentDisposalStep.step_name
+        )
     )
-    attempt_number = attempt_result.scalar() or 1
+    new_steps_from_db = after_steps_result.scalars().all()
+
+    retry_step_db = None
+    subsequent_steps_db = []
+    for step_db in new_steps_from_db:
+        if step_db.step_name == step_name and retry_step_db is None:
+            retry_step_db = step_db
+        else:
+            subsequent_steps_db.append(step_db)
+
+    if not retry_step_db:
+        retry_step_db_result = await db.execute(
+            select(AccidentDisposalStep).where(
+                and_(
+                    AccidentDisposalStep.accident_id == accident_id,
+                    AccidentDisposalStep.step_name == step_name
+                )
+            ).order_by(desc(AccidentDisposalStep.attempt_number))
+        )
+        retry_step_db = retry_step_db_result.scalars().first()
+
+    retry_started_at = retry_step_db.started_at if retry_step_db else retry_step_result.executed_at
+    retry_completed_at = retry_step_db.completed_at if retry_step_db else retry_step_result.executed_at
+    retry_result_data = retry_step_db.result_data if retry_step_db else None
+
+    subsequent_executions = []
+    if subsequent_steps_db:
+        for step_db in subsequent_steps_db:
+            subsequent_executions.append(SubsequentStepExecution(
+                step_name=step_db.step_name,
+                success=step_db.status == "success",
+                status=step_db.status,
+                message=step_db.message or "",
+                error=step_db.error,
+                started_at=step_db.started_at,
+                completed_at=step_db.completed_at,
+                result_data=step_db.result_data
+            ))
+    else:
+        for s in step_executions:
+            if s.step != step_name:
+                step_db_result = await db.execute(
+                    select(AccidentDisposalStep).where(
+                        and_(
+                            AccidentDisposalStep.accident_id == accident_id,
+                            AccidentDisposalStep.step_name == s.step,
+                            AccidentDisposalStep.attempt_number > attempt_before
+                        )
+                    ).order_by(desc(AccidentDisposalStep.attempt_number))
+                )
+                step_db_obj = step_db_result.scalars().first()
+                subsequent_executions.append(SubsequentStepExecution(
+                    step_name=s.step,
+                    success=s.success,
+                    status="success" if s.success else "failed",
+                    message=s.message,
+                    error=s.error,
+                    started_at=step_db_obj.started_at if step_db_obj else s.executed_at,
+                    completed_at=step_db_obj.completed_at if step_db_obj else s.executed_at,
+                    result_data=step_db_obj.result_data if step_db_obj else None
+                ))
+
+    attempt_number = (retry_step_db.attempt_number if retry_step_db else attempt_before + 1)
 
     all_succeeded = retry_step_result.success and all(s.success for s in subsequent_executions)
 
@@ -1042,9 +1110,9 @@ async def retry_disposal_step(
         success=retry_step_result.success,
         message=retry_step_result.message,
         error=retry_step_result.error,
-        result_data=None,
-        started_at=retry_step_result.executed_at,
-        completed_at=retry_step_result.executed_at,
+        result_data=retry_result_data,
+        started_at=retry_started_at,
+        completed_at=retry_completed_at,
         subsequent_executed=subsequent_executions,
         new_blocked_at_step=accident.blocked_at_step,
         all_succeeded=all_succeeded
